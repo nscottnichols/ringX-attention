@@ -18,12 +18,39 @@ This repo supports optimized implementations of ring attention on HPC:
 | X4    |  broadcast(kv) reduce(qkv); O(4hbs/N)                                                              | O(hbs/N)   |
 
 ## Installation
-Before proceeding as follows, make sure you have installed PyTorch and FlashAttention (tested with v2.7).
+Before proceeding as follows, make sure you have installed PyTorch. FlashAttention (tested with v2.7) is optional: if it is available the package will use it by default, otherwise it falls back to a portable PyTorch backend.
 ```bash
 git clone https://github.com/jqyin/ringX-attention
 cd ringX-attention
 pip install -e .
 ```
+
+
+### Backend selection
+The package supports two local attention backends:
+
+- `flash_attn`: uses the FlashAttention kernels when the `flash_attn` package is installed
+- `portable`: pure PyTorch fallback
+
+Selection rules:
+
+- default is `auto`, which prefers `flash_attn` when available and otherwise uses `portable`
+- set `RINGX_ATTN_BACKEND=portable` to force the fallback backend
+- or switch programmatically:
+
+```python
+from ringX_attn import set_backend
+
+set_backend("portable")
+```
+
+Each `ringX*_attn_func(...)` call also accepts `backend=None | "flash_attn" | "portable"` for per-call overrides.
+
+Current fallback limitations:
+
+- `dropout_p` must be `0`
+- `alibi_slopes` is not supported
+
 
 ## Usage on Frontier 
 ### Software environment 
