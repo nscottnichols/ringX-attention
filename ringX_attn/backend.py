@@ -171,30 +171,40 @@ def _flash_backward(
     return dq, dk, dv
 
 
-def _portable_tile_sizes() -> Tuple[int, int]:
-    q_tile = int(os.environ.get("RINGX_ATTN_PORTABLE_Q_TILE", "128"))
-    k_tile = int(os.environ.get("RINGX_ATTN_PORTABLE_K_TILE", "64"))
-    if q_tile <= 0 or k_tile <= 0:
-        raise ValueError("Portable tile sizes must be positive integers.")
-    return q_tile, k_tile
+def _portable_q_tile_size(batch: int, nheads: int, seqlen_k: int, device: torch.device) -> int:
+    override = os.environ.get("RINGX_ATTN_PORTABLE_Q_TILE")
+    if override is not None:
+        q_tile = int(override)
+        if q_tile <= 0:
+            raise ValueError("Portable Q tile size must be a positive integer.")
+        return q_tile
+
+    target_mb = int(os.environ.get("RINGX_ATTN_PORTABLE_SCORE_CHUNK_MB", "256"))
+    if target_mb <= 0:
+        raise ValueError("RINGX_ATTN_PORTABLE_SCORE_CHUNK_MB must be a positive integer.")
+
+    bytes_per_score = torch.tensor([], device=device, dtype=torch.float32).element_size()
+    denom = max(batch * nheads * seqlen_k * bytes_per_score, 1)
+    q_tile = max(16, (target_mb * 1024 * 1024) // denom)
+    return max(16, q_tile)
 
 
 
-def _apply_local_mask_(
-    scores: torch.Tensor,
+def _build_block_mask(
     q_start: int,
-    k_start: int,
+    q_end: int,
+    seq_k: int,
     causal: bool,
     window_size: Tuple[int, int],
-) -> None:
+    device: torch.device,
+) -> Optional[torch.Tensor]:
     invalid = None
-    q_len = scores.shape[-2]
-    k_len = scores.shape[-1]
     if causal or window_size[0] >= 0 or window_size[1] >= 0:
-        q_pos = torch.arange(q_start, q_start + q_len, device=scores.device).unsqueeze(-1)
-        k_pos = torch.arange(k_start, k_start + k_len, device=scores.device).unsqueeze(0)
+        q_pos = torch.arange(q_start, q_end, device=device).unsqueeze(-1)
+        k_pos = torch.arange(seq_k, device=device).unsqueeze(0)
         if causal:
             invalid = k_pos > q_pos
+
         window_left, window_right = window_size
         if window_left >= 0:
             left_invalid = k_pos < (q_pos - window_left)
@@ -202,8 +212,7 @@ def _apply_local_mask_(
         if window_right >= 0:
             right_invalid = k_pos > (q_pos + window_right)
             invalid = right_invalid if invalid is None else (invalid | right_invalid)
-    if invalid is not None:
-        scores.masked_fill_(invalid.unsqueeze(0).unsqueeze(0), float("-inf"))
+    return invalid
 
 
 
@@ -226,64 +235,44 @@ def _portable_forward(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    qh = q.permute(0, 2, 1, 3).to(torch.float32)
-    kh = k.permute(0, 2, 1, 3).to(torch.float32)
-    vh = v.permute(0, 2, 1, 3).to(torch.float32)
+    qh = q.permute(0, 2, 1, 3).contiguous().to(torch.float32)
+    kh = k.permute(0, 2, 1, 3).contiguous().to(torch.float32)
+    vh = v.permute(0, 2, 1, 3).contiguous().to(torch.float32)
 
     batch, nheads, seqlen_q, head_dim = qh.shape
     seqlen_k = kh.shape[-2]
-    q_tile, k_tile = _portable_tile_sizes()
+    q_tile = min(seqlen_q, _portable_q_tile_size(batch, nheads, seqlen_k, q.device))
 
-    out = torch.empty((batch, nheads, seqlen_q, head_dim), device=q.device, dtype=torch.float32)
-    lse = torch.empty((batch, nheads, seqlen_q), device=q.device, dtype=torch.float32)
+    batch_heads = batch * nheads
+    qh = qh.reshape(batch_heads, seqlen_q, head_dim)
+    kh = kh.reshape(batch_heads, seqlen_k, head_dim)
+    vh = vh.reshape(batch_heads, seqlen_k, head_dim)
+    kh_t = kh.transpose(-1, -2).contiguous()
+
+    out = torch.empty((batch_heads, seqlen_q, head_dim), device=q.device, dtype=torch.float32)
+    lse = torch.empty((batch_heads, seqlen_q), device=q.device, dtype=torch.float32)
 
     for q_start in range(0, seqlen_q, q_tile):
         q_end = min(q_start + q_tile, seqlen_q)
-        q_blk = qh[:, :, q_start:q_end, :]
-        q_len = q_end - q_start
+        scores = torch.bmm(qh[:, q_start:q_end, :], kh_t) * softmax_scale
 
-        m_i = torch.full((batch, nheads, q_len), float("-inf"), device=q.device, dtype=torch.float32)
-        l_i = torch.zeros((batch, nheads, q_len), device=q.device, dtype=torch.float32)
-        acc = torch.zeros((batch, nheads, q_len, head_dim), device=q.device, dtype=torch.float32)
+        invalid = _build_block_mask(q_start, q_end, seqlen_k, causal, window_size, q.device)
+        if invalid is not None:
+            scores.masked_fill_(invalid.unsqueeze(0), float("-inf"))
 
-        for k_start in range(0, seqlen_k, k_tile):
-            k_end = min(k_start + k_tile, seqlen_k)
-            k_blk = kh[:, :, k_start:k_end, :]
-            v_blk = vh[:, :, k_start:k_end, :]
-
-            scores = torch.matmul(q_blk, k_blk.transpose(-1, -2)) * softmax_scale
-            _apply_local_mask_(scores, q_start, k_start, causal, window_size)
-
-            block_m = scores.amax(dim=-1)
-            new_m = torch.maximum(m_i, block_m)
-            alpha = torch.where(
-                torch.isfinite(m_i),
-                torch.exp(m_i - new_m),
-                torch.zeros_like(new_m),
-            )
-            p = torch.where(
-                torch.isfinite(scores),
-                torch.exp(scores - new_m.unsqueeze(-1)),
-                torch.zeros_like(scores),
-            )
-            l_i = l_i * alpha + p.sum(dim=-1)
-            acc = acc * alpha.unsqueeze(-1) + torch.matmul(p, v_blk)
-            m_i = new_m
-
-        valid = l_i > 0
-        out[:, :, q_start:q_end, :] = torch.where(
-            valid.unsqueeze(-1),
-            acc / l_i.unsqueeze(-1).clamp_min(1e-20),
-            torch.zeros_like(acc),
-        )
-        lse[:, :, q_start:q_end] = torch.where(
-            valid,
-            torch.log(l_i) + m_i,
-            torch.full_like(m_i, float("-inf")),
+        block_lse = torch.logsumexp(scores, dim=-1)
+        probs = torch.where(
+            torch.isfinite(block_lse).unsqueeze(-1),
+            torch.exp(scores - block_lse.unsqueeze(-1)),
+            torch.zeros_like(scores),
         )
 
-    out = out.permute(0, 2, 1, 3).contiguous()
-    return out.to(q.dtype), lse.contiguous()
+        out[:, q_start:q_end, :] = torch.bmm(probs, vh)
+        lse[:, q_start:q_end] = block_lse
+
+    out = out.reshape(batch, nheads, seqlen_q, head_dim).permute(0, 2, 1, 3).contiguous()
+    lse = lse.reshape(batch, nheads, seqlen_q).contiguous()
+    return out.to(q.dtype), lse
 
 
 
@@ -309,55 +298,60 @@ def _portable_backward(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    qh = q.permute(0, 2, 1, 3).to(torch.float32)
-    kh = k.permute(0, 2, 1, 3).to(torch.float32)
-    vh = v.permute(0, 2, 1, 3).to(torch.float32)
-    douth = dout.permute(0, 2, 1, 3).to(torch.float32)
-    outh = out.permute(0, 2, 1, 3).to(torch.float32)
-    lse = softmax_lse.to(torch.float32)
+    qh = q.permute(0, 2, 1, 3).contiguous().to(torch.float32)
+    kh = k.permute(0, 2, 1, 3).contiguous().to(torch.float32)
+    vh = v.permute(0, 2, 1, 3).contiguous().to(torch.float32)
+    douth = dout.permute(0, 2, 1, 3).contiguous().to(torch.float32)
+    outh = out.permute(0, 2, 1, 3).contiguous().to(torch.float32)
+    lse = softmax_lse.contiguous().to(torch.float32)
 
     batch, nheads, seqlen_q, head_dim = qh.shape
     seqlen_k = kh.shape[-2]
-    q_tile, k_tile = _portable_tile_sizes()
+    q_tile = min(seqlen_q, _portable_q_tile_size(batch, nheads, seqlen_k, q.device))
 
-    dq = torch.zeros_like(qh)
+    batch_heads = batch * nheads
+    qh = qh.reshape(batch_heads, seqlen_q, head_dim)
+    kh = kh.reshape(batch_heads, seqlen_k, head_dim)
+    vh = vh.reshape(batch_heads, seqlen_k, head_dim)
+    douth = douth.reshape(batch_heads, seqlen_q, head_dim)
+    outh = outh.reshape(batch_heads, seqlen_q, head_dim)
+    lse = lse.reshape(batch_heads, seqlen_q)
+
+    kh_t = kh.transpose(-1, -2).contiguous()
+    vh_t = vh.transpose(-1, -2).contiguous()
+
+    dq = torch.empty_like(qh)
     dk = torch.zeros_like(kh)
     dv = torch.zeros_like(vh)
     delta = (douth * outh).sum(dim=-1)
 
     for q_start in range(0, seqlen_q, q_tile):
         q_end = min(q_start + q_tile, seqlen_q)
-        q_blk = qh[:, :, q_start:q_end, :]
-        do_blk = douth[:, :, q_start:q_end, :]
-        lse_blk = lse[:, :, q_start:q_end]
-        delta_blk = delta[:, :, q_start:q_end]
-        dq_blk = torch.zeros_like(q_blk)
+        q_blk = qh[:, q_start:q_end, :]
+        do_blk = douth[:, q_start:q_end, :]
+        lse_blk = lse[:, q_start:q_end]
+        delta_blk = delta[:, q_start:q_end]
 
-        for k_start in range(0, seqlen_k, k_tile):
-            k_end = min(k_start + k_tile, seqlen_k)
-            k_blk = kh[:, :, k_start:k_end, :]
-            v_blk = vh[:, :, k_start:k_end, :]
+        scores = torch.bmm(q_blk, kh_t) * softmax_scale
+        invalid = _build_block_mask(q_start, q_end, seqlen_k, causal, window_size, q.device)
+        if invalid is not None:
+            scores.masked_fill_(invalid.unsqueeze(0), float("-inf"))
 
-            scores = torch.matmul(q_blk, k_blk.transpose(-1, -2)) * softmax_scale
-            _apply_local_mask_(scores, q_start, k_start, causal, window_size)
+        p = torch.where(
+            torch.isfinite(lse_blk).unsqueeze(-1),
+            torch.exp(scores - lse_blk.unsqueeze(-1)),
+            torch.zeros_like(scores),
+        )
+        dp = torch.bmm(do_blk, vh_t)
+        ds = p * (dp - delta_blk.unsqueeze(-1))
 
-            p = torch.where(
-                torch.isfinite(scores) & torch.isfinite(lse_blk.unsqueeze(-1)),
-                torch.exp(scores - lse_blk.unsqueeze(-1)),
-                torch.zeros_like(scores),
-            )
-            dp = torch.matmul(do_blk, v_blk.transpose(-1, -2))
-            ds = p * (dp - delta_blk.unsqueeze(-1))
+        dq[:, q_start:q_end, :] = torch.bmm(ds, kh) * softmax_scale
+        dk += torch.bmm(ds.transpose(-1, -2), q_blk) * softmax_scale
+        dv += torch.bmm(p.transpose(-1, -2), do_blk)
 
-            dq_blk = dq_blk + torch.matmul(ds, k_blk) * softmax_scale
-            dk[:, :, k_start:k_end, :] = dk[:, :, k_start:k_end, :] + torch.matmul(ds.transpose(-1, -2), q_blk) * softmax_scale
-            dv[:, :, k_start:k_end, :] = dv[:, :, k_start:k_end, :] + torch.matmul(p.transpose(-1, -2), do_blk)
-
-        dq[:, :, q_start:q_end, :] = dq_blk
-
-    dq = dq.permute(0, 2, 1, 3).contiguous().to(q.dtype)
-    dk = dk.permute(0, 2, 1, 3).contiguous().to(k.dtype)
-    dv = dv.permute(0, 2, 1, 3).contiguous().to(v.dtype)
+    dq = dq.reshape(batch, nheads, seqlen_q, head_dim).permute(0, 2, 1, 3).contiguous().to(q.dtype)
+    dk = dk.reshape(batch, nheads, seqlen_k, head_dim).permute(0, 2, 1, 3).contiguous().to(k.dtype)
+    dv = dv.reshape(batch, nheads, seqlen_k, head_dim).permute(0, 2, 1, 3).contiguous().to(v.dtype)
     return dq, dk, dv
 
 

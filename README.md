@@ -51,6 +51,11 @@ Current fallback limitations:
 - `dropout_p` must be `0`
 - `alibi_slopes` is not supported
 
+Portable backend tuning:
+
+- `RINGX_ATTN_PORTABLE_Q_TILE=<int>` forces the number of query rows processed per chunk
+- `RINGX_ATTN_PORTABLE_SCORE_CHUNK_MB=<int>` sets the default score-buffer budget (256 MB by default) used to auto-pick the query chunk size
+
 
 ## Usage on Frontier 
 ### Software environment 
@@ -144,3 +149,4 @@ If you find this work helpful in your research or applications, please consider 
       year={2026},
 }
 ``` 
+
