@@ -3,18 +3,34 @@ import os
 import torch
 import torch.distributed as dist
 from datetime import timedelta
-from ring_flash_attn import (
-    ring_flash_attn_func,
-    zigzag_ring_flash_attn_func,
-    stripe_flash_attn_func,
-)
+try:
+    from ring_flash_attn import (
+        ring_flash_attn_func,
+        zigzag_ring_flash_attn_func,
+        stripe_flash_attn_func,
+    )
+    baseline_funcs = [
+        zigzag_ring_flash_attn_func,
+        stripe_flash_attn_func,
+        ring_flash_attn_func,
+    ]
+except ModuleNotFoundError:
+    baseline_funcs = []
 import argparse, importlib
+
+def shard_simple(x, rank, world_size):
+    return x.chunk(world_size, dim=1)[rank].contiguous()
+
+def shard_balanced(x, rank, world_size):
+    parts = x.chunk(2 * world_size, dim=1)
+    return torch.cat([parts[rank], parts[2 * world_size - rank - 1]], dim=1).contiguous()
 
 def benchmark(args, f, warmup_iter=1, num_iter=100, forward_only=True, log=True, profile=False):
     dtype = torch.bfloat16
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"cuda:0")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
     batch_size = args.batch_size
@@ -61,6 +77,19 @@ def benchmark(args, f, warmup_iter=1, num_iter=100, forward_only=True, log=True,
     dout = torch.randn(
         batch_size, seqlen, num_heads, head_dim, device=device, dtype=dtype
     )
+
+    algo = args.module.rsplit(".", 1)[-1]
+
+    if algo in {"ringX1_attn", "ringX2_attn"}:
+        q = shard_simple(q, rank, world_size)
+        k = shard_simple(k, rank, world_size)
+        v = shard_simple(v, rank, world_size)
+        dout = shard_simple(dout, rank, world_size)
+    elif algo in {"ringX3_attn", "ringX3b_attn", "ringX4_attn", "ringX4o_attn"}:
+        q = shard_balanced(q, rank, world_size)
+        k = shard_balanced(k, rank, world_size)
+        v = shard_balanced(v, rank, world_size)
+        dout = shard_balanced(dout, rank, world_size)
 
     if profile:
         torch.backends.cudnn.benchmark = True
@@ -178,7 +207,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         module = importlib.import_module(args.module)
-        func_name = f"{args.module}_func"
+        func_name = f"{args.module.rsplit('.', 1)[-1]}_func"
         ringX_attn_func = getattr(module, func_name)
     except ModuleNotFoundError:
         print(f"Error: Module '{args.module}' not found.") 
@@ -194,12 +223,7 @@ if __name__ == "__main__":
     profile = args.profile
     num_iter = args.num_iter
 
-    for f in [
-        ringX_attn_func,
-        zigzag_ring_flash_attn_func,
-        stripe_flash_attn_func,
-        ring_flash_attn_func,
-    ]:
+    for f in [ringX_attn_func, *baseline_funcs]:
         torch.cuda.empty_cache()
         if rank == 0:
             print(f"# {f.__name__}")
