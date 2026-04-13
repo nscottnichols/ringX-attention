@@ -1,3 +1,4 @@
+from .backend import available_backends, get_backend, set_backend
 from .ringX1_attn import ringX1_attn_func 
 from .ringX1o_attn import ringX1o_attn_func 
 from .ringX2_attn import ringX2_attn_func 

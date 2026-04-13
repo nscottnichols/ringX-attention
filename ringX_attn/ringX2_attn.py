@@ -1,7 +1,6 @@
 import torch
 import torch.distributed as dist
-from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
-from .utils import get_default_args
+from .backend import local_attn_forward, local_attn_backward
 
 def ringX_attn_forward(
     process_group,
@@ -14,6 +13,7 @@ def ringX_attn_forward(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
+    backend=None,
 ):
 
     rank = dist.get_rank(group=process_group)
@@ -21,36 +21,18 @@ def ringX_attn_forward(
     out, lse, lse_max = None, None, None
     q_buffer = torch.empty_like(q).contiguous()
     def flash_forward(q, k, v, causal):
-        params = get_default_args(_flash_attn_forward).copy()
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                     {
-                         "window_size_left": window_size[0],
-                         "window_size_right": window_size[1],
-                     }
-            )
-        params.update(
-            {
-                "q": q,
-                "k": k,
-                "v": v,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
-            }
+        return local_attn_forward(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            backend=backend,
         )
-        outputs = _flash_attn_forward(**params)
-        if len(outputs) == 8:
-            out, _, _, _, _, lse, _, _ = outputs
-        else:
-            assert len(outputs) == 4
-            out, lse, _, _ = outputs
-
-        return out, lse
 
     for i in range(world_size - 1, -1, -1):
         q_buffer[:] = q
@@ -95,6 +77,7 @@ def ringX_attn_backward(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
+    backend=None,
 ):
     assert causal == True, "current implementation is for causal only"
     rank = dist.get_rank(group=process_group)
@@ -108,39 +91,22 @@ def ringX_attn_backward(
     k_size0 = k.shape[0]
     dkv_sum = torch.empty_like(kv, dtype=torch.float32).contiguous()
     dq_sum = torch.empty_like(q, dtype=torch.float32).contiguous()
-
     def flash_backward(dout, q, k, v, out, softmax_lse, causal):
-        params = get_default_args(_flash_attn_backward).copy()
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                     {
-                         "window_size_left": window_size[0],
-                         "window_size_right": window_size[1],
-                     }
-            )
-        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-        params.update(
-            {
-                "dout": dout,
-                "q": q,
-                "k": k,
-                "v": v,
-                "out": out,
-                "softmax_lse": softmax_lse,
-                "dq": dq_buffer,
-                "dk": dk_buffer,
-                "dv": dv_buffer,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": alibi_slopes,
-                "deterministic": deterministic,
-                "rng_state": rng_state,
-            }
+        return local_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            backend=backend,
         )
-        _flash_attn_backward(**params)
 
     for i in range(world_size):
         kv_buffer[:k_size0].copy_(k)
@@ -149,9 +115,9 @@ def ringX_attn_backward(
         dist.broadcast(kv_buffer, src=res_rank, group=process_group)
        
         if rank == i:
-            flash_backward(dout, q, k, v, out, softmax_lse, causal=True)
+            dq_buffer, dk_buffer, dv_buffer = flash_backward(dout, q, k, v, out, softmax_lse, causal=True)
         elif rank > i:
-            flash_backward(dout, q, kv_buffer[:k_size0], kv_buffer[k_size0:], out, softmax_lse, causal=False)
+            dq_buffer, dk_buffer, dv_buffer = flash_backward(dout, q, kv_buffer[:k_size0], kv_buffer[k_size0:], out, softmax_lse, causal=False)
             if dq is None:
                 dq = dq_buffer.to(torch.float32)
             else:
@@ -192,6 +158,7 @@ class RingXAttnFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         group,
+        backend,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -210,6 +177,7 @@ class RingXAttnFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=False,
+            backend=backend,
         )
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -220,6 +188,7 @@ class RingXAttnFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.backend = backend
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -239,8 +208,9 @@ class RingXAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            backend=ctx.backend,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
 def ringX2_attn_func(
@@ -255,6 +225,7 @@ def ringX2_attn_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    backend=None,
 ):
     return RingXAttnFunc.apply(
         q,
@@ -268,4 +239,5 @@ def ringX2_attn_func(
         deterministic,
         return_attn_probs,
         group,
+        backend,
     )

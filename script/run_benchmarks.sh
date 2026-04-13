@@ -19,11 +19,6 @@ mkdir -p "$OUT_DIR/raw"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$REPO_ROOT/ringX_attn:$REPO_ROOT/benchmark${RING_FLASH_ATTN_ROOT:+:$RING_FLASH_ATTN_ROOT}:${PYTHONPATH:-}"
 
-if grep -q 'cuda:0' benchmark/benchmark_ringX_func.py; then
-  echo "WARNING: benchmark/benchmark_ringX_func.py still hardcodes cuda:0." >&2
-  echo "Patch it to use LOCAL_RANK before using NPROC>1." >&2
-fi
-
 if ! python - <<'PY' >/dev/null 2>&1
 import flash_attn
 PY
