@@ -43,6 +43,100 @@ def _current_backend_name(func):
     return ringx_backend.get_backend() if _is_ringx_impl(func) else "external"
 
 
+_FUSED_UNSUPPORTED_PREFIX = "backend='fused' was requested, but the current attention call is not supported:"
+
+
+def _classify_benchmark_exception(func, mode, exc):
+    requested_backend = _current_backend_name(func)
+    reason = f"{type(exc).__name__}: {exc}"
+    if requested_backend == "fused" and _FUSED_UNSUPPORTED_PREFIX in str(exc):
+        return {
+            "status": "skipped",
+            "requested_backend": requested_backend,
+            "forward_backend": "unsupported",
+            "backward_backend": "unsupported" if mode != "forward" else "n/a",
+            "iter_per_s": None,
+            "total_sec": None,
+            "reason": reason,
+        }
+    return {
+        "status": "failed",
+        "requested_backend": requested_backend,
+        "forward_backend": "error",
+        "backward_backend": "error" if mode != "forward" else "n/a",
+        "iter_per_s": None,
+        "total_sec": None,
+        "reason": reason,
+    }
+
+
+def _merge_rank_results(results):
+    statuses = {result["status"] for result in results}
+    if statuses == {"ok"}:
+        return results[0]
+
+    if len(statuses) > 1:
+        rank_summaries = [f"rank{rank}:{result['status']}" for rank, result in enumerate(results)]
+        first_non_ok = next(result for result in results if result["status"] != "ok")
+        merged = dict(first_non_ok)
+        merged.update(
+            status="failed",
+            iter_per_s=None,
+            total_sec=None,
+            forward_backend=first_non_ok.get("forward_backend", "error"),
+            backward_backend=first_non_ok.get("backward_backend", "n/a"),
+            reason=(
+                "inconsistent benchmark outcome across distributed ranks: "
+                + ", ".join(rank_summaries)
+                + f"; first non-ok reason: {first_non_ok['reason']}"
+            ),
+        )
+        return merged
+
+    if statuses == {"skipped"}:
+        return results[0]
+
+    return next(result for result in results if result["status"] == "failed")
+
+
+
+def _run_benchmark_distributed(args, func, mode, *, num_iter, log, profile):
+    rank = dist.get_rank()
+    local_traceback = ""
+    try:
+        local_result = benchmark(
+            args,
+            func,
+            mode=mode,
+            num_iter=num_iter,
+            log=log,
+            profile=profile,
+        )
+    except Exception as exc:
+        local_result = _classify_benchmark_exception(func, mode, exc)
+        if local_result["status"] == "failed":
+            local_traceback = traceback.format_exc()
+
+    gathered_results = [None for _ in range(dist.get_world_size())]
+    gathered_tracebacks = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered_results, local_result)
+    dist.all_gather_object(gathered_tracebacks, local_traceback)
+    merged_result = _merge_rank_results(gathered_results)
+
+    if rank == 0:
+        if merged_result["status"] == "failed":
+            print(f"Benchmark failed for {func.__name__} [{mode}]: {merged_result['reason']}")
+            for failed_rank, (result, tb) in enumerate(zip(gathered_results, gathered_tracebacks)):
+                if result["status"] != "failed":
+                    continue
+                print(f"[rank{failed_rank}] {result['reason']}")
+                if tb:
+                    print(tb)
+        elif merged_result["status"] == "skipped":
+            print(f"Benchmark skipped for {func.__name__} [{mode}]: {merged_result['reason']}")
+    return merged_result
+
+
 
 def _preflight_result(func, q, k, v, dout, *, causal, mode, deterministic=False):
     if not _is_ringx_impl(func):
@@ -494,29 +588,14 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
             if rank == 0:
                 print(f"# {func.__name__} [{mode}]")
-            try:
-                result = benchmark(
-                    args,
-                    func,
-                    mode=mode,
-                    num_iter=num_iter,
-                    log=True,
-                    profile=profile,
-                )
-            except Exception as exc:
-                result = {
-                    "status": "failed",
-                    "requested_backend": _current_backend_name(func),
-                    "forward_backend": "error",
-                    "backward_backend": "error" if mode != "forward" else "n/a",
-                    "iter_per_s": None,
-                    "total_sec": None,
-                    "reason": f"{type(exc).__name__}: {exc}",
-                }
-                if rank == 0:
-                    print(f"Benchmark failed for {func.__name__} [{mode}]: {exc}")
-                    print(traceback.format_exc())
+            result = _run_benchmark_distributed(
+                args,
+                func,
+                mode,
+                num_iter=num_iter,
+                log=True,
+                profile=profile,
+            )
             _emit_result(args, func, mode, result)
-            dist.barrier()
 
     dist.destroy_process_group()
