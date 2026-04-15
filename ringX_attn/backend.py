@@ -63,9 +63,11 @@ def _fused_support_error(
     module = _load_fused_module()
     if module is None:
         return _fused_import_error_message()
-    support_fn = getattr(module, "support_error", None)
+    support_fn = getattr(module, "forward_support_error", None)
     if support_fn is None:
-        return "the optional Triton fused attention module does not expose support_error()."
+        support_fn = getattr(module, "support_error", None)
+    if support_fn is None:
+        return "the optional Triton fused attention module does not expose forward_support_error()."
     return support_fn(
         q,
         k,
@@ -73,6 +75,48 @@ def _fused_support_error(
         dropout_p=dropout_p,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
+    )
+
+
+def _fused_backward_support_error(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dropout_p=0.0,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    module = _load_fused_module()
+    if module is None:
+        return _fused_import_error_message()
+    support_fn = getattr(module, "backward_support_error", None)
+    if support_fn is None:
+        return "the optional Triton fused attention module does not expose backward_support_error()."
+    return support_fn(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+
+
+def _resolve_fused_runtime_backend(requested: str, fused_error: Optional[str]) -> str:
+    if fused_error is None:
+        return "fused"
+    if requested == "auto":
+        return "portable"
+    raise RuntimeError(
+        "backend='fused' was requested, but the current attention call is not supported: "
+        f"{fused_error} Use backend='portable', call set_backend('portable'), or set "
+        "RINGX_ATTN_BACKEND=portable."
     )
 
 
@@ -98,15 +142,38 @@ def _runtime_backend(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
     )
-    if fused_error is None:
-        return "fused"
-    if requested == "auto":
-        return "portable"
-    raise RuntimeError(
-        "backend='fused' was requested, but the current attention call is not supported: "
-        f"{fused_error} Use backend='portable', call set_backend('portable'), or set "
-        "RINGX_ATTN_BACKEND=portable."
+    return _resolve_fused_runtime_backend(requested, fused_error)
+
+
+def _runtime_backward_backend(
+    backend: Optional[str],
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dropout_p=0.0,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+) -> str:
+    requested = _BACKEND if backend is None else backend
+    selected = resolve_backend(backend)
+    if selected != "fused":
+        return selected
+
+    fused_error = _fused_backward_support_error(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
     )
+    return _resolve_fused_runtime_backend(requested, fused_error)
 
 
 def set_backend(backend: str) -> None:
@@ -325,10 +392,13 @@ def _fused_backward(
     alibi_slopes=None,
     deterministic=False,
 ):
-    error = _fused_support_error(
+    error = _fused_backward_support_error(
+        dout,
         q,
         k,
         v,
+        out,
+        softmax_lse,
         dropout_p=dropout_p,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
@@ -622,11 +692,14 @@ def local_attn_backward(
     deterministic=False,
     backend: Optional[str] = None,
 ):
-    selected = _runtime_backend(
+    selected = _runtime_backward_backend(
         backend,
+        dout,
         q,
         k,
         v,
+        out,
+        softmax_lse,
         dropout_p=dropout_p,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
