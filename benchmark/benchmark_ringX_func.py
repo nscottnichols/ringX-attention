@@ -43,102 +43,29 @@ def _current_backend_name(func):
     return ringx_backend.get_backend() if _is_ringx_impl(func) else "external"
 
 
-_FUSED_UNSUPPORTED_PREFIX = "backend='fused' was requested, but the current attention call is not supported:"
-
-
-def _classify_benchmark_exception(func, mode, exc):
-    requested_backend = _current_backend_name(func)
-    reason = f"{type(exc).__name__}: {exc}"
-    if requested_backend == "fused" and _FUSED_UNSUPPORTED_PREFIX in str(exc):
-        return {
-            "status": "skipped",
-            "requested_backend": requested_backend,
-            "forward_backend": "unsupported",
-            "backward_backend": "unsupported" if mode != "forward" else "n/a",
-            "iter_per_s": None,
-            "total_sec": None,
-            "reason": reason,
-        }
-    return {
-        "status": "failed",
-        "requested_backend": requested_backend,
-        "forward_backend": "error",
-        "backward_backend": "error" if mode != "forward" else "n/a",
-        "iter_per_s": None,
-        "total_sec": None,
-        "reason": reason,
-    }
-
-
-def _merge_rank_results(results):
-    statuses = {result["status"] for result in results}
-    if statuses == {"ok"}:
-        return results[0]
-
-    if len(statuses) > 1:
-        rank_summaries = [f"rank{rank}:{result['status']}" for rank, result in enumerate(results)]
-        first_non_ok = next(result for result in results if result["status"] != "ok")
-        merged = dict(first_non_ok)
-        merged.update(
-            status="failed",
-            iter_per_s=None,
-            total_sec=None,
-            forward_backend=first_non_ok.get("forward_backend", "error"),
-            backward_backend=first_non_ok.get("backward_backend", "n/a"),
-            reason=(
-                "inconsistent benchmark outcome across distributed ranks: "
-                + ", ".join(rank_summaries)
-                + f"; first non-ok reason: {first_non_ok['reason']}"
-            ),
-        )
-        return merged
-
-    if statuses == {"skipped"}:
-        return results[0]
-
-    return next(result for result in results if result["status"] == "failed")
+_FUSED_BENCHMARK_UNSUPPORTED_ALGOS = {
+    "ringX3_attn": "ringX3_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
+    "ringX4_attn": "ringX4_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
+    "ringX4o_attn": "ringX4o_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
+}
 
 
 
-def _run_benchmark_distributed(args, func, mode, *, num_iter, log, profile):
-    rank = dist.get_rank()
-    local_traceback = ""
-    try:
-        local_result = benchmark(
-            args,
-            func,
-            mode=mode,
-            num_iter=num_iter,
-            log=log,
-            profile=profile,
-        )
-    except Exception as exc:
-        local_result = _classify_benchmark_exception(func, mode, exc)
-        if local_result["status"] == "failed":
-            local_traceback = traceback.format_exc()
-
-    gathered_results = [None for _ in range(dist.get_world_size())]
-    gathered_tracebacks = [None for _ in range(dist.get_world_size())]
-    dist.all_gather_object(gathered_results, local_result)
-    dist.all_gather_object(gathered_tracebacks, local_traceback)
-    merged_result = _merge_rank_results(gathered_results)
-
-    if rank == 0:
-        if merged_result["status"] == "failed":
-            print(f"Benchmark failed for {func.__name__} [{mode}]: {merged_result['reason']}")
-            for failed_rank, (result, tb) in enumerate(zip(gathered_results, gathered_tracebacks)):
-                if result["status"] != "failed":
-                    continue
-                print(f"[rank{failed_rank}] {result['reason']}")
-                if tb:
-                    print(tb)
-        elif merged_result["status"] == "skipped":
-            print(f"Benchmark skipped for {func.__name__} [{mode}]: {merged_result['reason']}")
-    return merged_result
+def _algo_backend_support_error(args, requested_backend):
+    if requested_backend != "fused":
+        return None
+    algo = args.module.rsplit(".", 1)[-1]
+    reason = _FUSED_BENCHMARK_UNSUPPORTED_ALGOS.get(algo)
+    if reason is None:
+        return None
+    return (
+        f"benchmark preflight: backend='fused' is not supported for {algo}. {reason} "
+        "Use backend='portable', backend='auto', or benchmark an algorithm whose local attention calls keep q, k, and v aligned."
+    )
 
 
 
-def _preflight_result(func, q, k, v, dout, *, causal, mode, deterministic=False):
+def _preflight_result(args, func, q, k, v, dout, *, causal, mode, deterministic=False):
     if not _is_ringx_impl(func):
         return {
             "status": "ready",
@@ -148,6 +75,17 @@ def _preflight_result(func, q, k, v, dout, *, causal, mode, deterministic=False)
             "reason": "",
         }
 
+    requested_backend = ringx_backend.get_backend()
+    algo_error = _algo_backend_support_error(args, requested_backend)
+    if algo_error is not None:
+        return {
+            "status": "skipped",
+            "requested_backend": requested_backend,
+            "forward_backend": "unsupported",
+            "backward_backend": "unsupported" if mode != "forward" else "n/a",
+            "reason": algo_error,
+        }
+
     kwargs = dict(
         dropout_p=0.0,
         causal=causal,
@@ -155,7 +93,6 @@ def _preflight_result(func, q, k, v, dout, *, causal, mode, deterministic=False)
         alibi_slopes=None,
         deterministic=deterministic,
     )
-    requested_backend = ringx_backend.get_backend()
     forward_error = ringx_backend.forward_support_error(
         q,
         k,
@@ -226,6 +163,18 @@ def _preflight_result(func, q, k, v, dout, *, causal, mode, deterministic=False)
         "backward_backend": backward_backend,
         "reason": "",
     }
+
+
+
+def _collect_preflight(preflight):
+    gathered = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, preflight)
+    for entry in gathered:
+        if entry is None:
+            continue
+        if entry.get("status") != "ready":
+            return entry
+    return preflight
 
 
 
@@ -385,7 +334,8 @@ def benchmark(args, func, warmup_iter=1, num_iter=100, mode="forward", log=True,
         v = shard_balanced(v, rank, world_size)
         dout = shard_balanced(dout, rank, world_size)
 
-    preflight = _preflight_result(
+    preflight = _collect_preflight(_preflight_result(
+        args,
         func,
         q,
         k,
@@ -394,7 +344,7 @@ def benchmark(args, func, warmup_iter=1, num_iter=100, mode="forward", log=True,
         causal=causal,
         mode=mode,
         deterministic=deterministic,
-    )
+    ))
     if preflight["status"] != "ready":
         return {
             "status": preflight["status"],
@@ -534,6 +484,23 @@ def _resolve_modes(args):
     return ["fwd_bwd"]
 
 
+
+def _available_impls(main_func):
+    return {func.__name__: func for func in [main_func, *baseline_funcs]}
+
+
+
+def _resolve_impls(args, main_func):
+    impls = _available_impls(main_func)
+    if args.impl is None:
+        return list(impls.values())
+    try:
+        return [impls[args.impl]]
+    except KeyError as exc:
+        names = ", ".join(sorted(impls))
+        raise ValueError(f"Unknown impl '{args.impl}'. Available implementations: {names}") from exc
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse model configuration arguments.")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training or inference.")
@@ -542,6 +509,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads.")
     parser.add_argument("--head_dim", type=int, default=64, help="Dimension of each attention head.")
     parser.add_argument("--module", type=str, required=True, help="Module name to import the function.")
+    parser.add_argument("--impl", type=str, help="Specific implementation name to benchmark. Defaults to the module implementation plus any available baselines.")
     parser.add_argument("--causal", action="store_true", help="Enable causal attention masking.")
     parser.add_argument("--forward_only", action="store_true", help="Legacy alias for --modes forward.")
     parser.add_argument(
@@ -582,20 +550,42 @@ if __name__ == "__main__":
     profile = args.profile
     num_iter = args.num_iter
     modes = _resolve_modes(args)
+    impls = _resolve_impls(args, ringX_attn_func)
+    exit_code = 0
 
-    for mode in modes:
-        for func in [ringX_attn_func, *baseline_funcs]:
-            torch.cuda.empty_cache()
-            if rank == 0:
-                print(f"# {func.__name__} [{mode}]")
-            result = _run_benchmark_distributed(
-                args,
-                func,
-                mode,
-                num_iter=num_iter,
-                log=True,
-                profile=profile,
-            )
-            _emit_result(args, func, mode, result)
+    try:
+        for mode in modes:
+            for func in impls:
+                torch.cuda.empty_cache()
+                if rank == 0:
+                    print(f"# {func.__name__} [{mode}]")
+                try:
+                    result = benchmark(
+                        args,
+                        func,
+                        mode=mode,
+                        num_iter=num_iter,
+                        log=True,
+                        profile=profile,
+                    )
+                except Exception as exc:
+                    result = {
+                        "status": "failed",
+                        "requested_backend": _current_backend_name(func),
+                        "forward_backend": "error",
+                        "backward_backend": "error" if mode != "forward" else "n/a",
+                        "iter_per_s": None,
+                        "total_sec": None,
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                    exit_code = 1
+                    if rank == 0:
+                        print(f"Benchmark failed for {func.__name__} [{mode}]: {exc}")
+                        print(traceback.format_exc())
+                _emit_result(args, func, mode, result)
+                if result["status"] == "failed":
+                    raise RuntimeError(result["reason"])
+    finally:
+        dist.destroy_process_group()
 
-    dist.destroy_process_group()
+    raise SystemExit(exit_code)

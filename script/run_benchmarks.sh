@@ -49,6 +49,15 @@ read -r -a SEQ_LENGTHS <<< "$SEQ_LENGTHS_STR"
 read -r -a ALGOS <<< "$ALGOS_STR"
 read -r -a BENCHMARK_MODES <<< "$BENCHMARK_MODES_STR"
 
+HAS_RING_FLASH_ATTN=0
+if python - <<'PY' >/dev/null 2>&1
+import importlib.util
+raise SystemExit(0 if importlib.util.find_spec("ring_flash_attn") is not None else 1)
+PY
+then
+  HAS_RING_FLASH_ATTN=1
+fi
+
 {
   echo "algo,impl,mode,status,requested_backend,forward_backend,backward_backend,causal,batch,seqlen,num_heads,head_dim,dtype,ngpus,iter_per_s,total_sec,reason,log_file"
 } > "$OUT_DIR/summary.csv"
@@ -112,45 +121,53 @@ for algo in "${ALGOS[@]}"; do
   esac
 
   for seqlen in "${SEQ_LENGTHS[@]}"; do
-    log_file="$OUT_DIR/raw/${algo}.b${BATCH_SIZE}.s${seqlen}.h${NUM_HEADS}.d${HEAD_DIM}.dtype${DTYPE}.log"
-
-    cmd=(
-      torchrun
-      --standalone
-      --nproc_per_node="$NPROC"
-      benchmark/benchmark_ringX_func.py
-      --module "$algo"
-      --batch_size "$BATCH_SIZE"
-      --num_iter "$NUM_ITER"
-      --seq_length "$seqlen"
-      --num_heads "$NUM_HEADS"
-      --head_dim "$HEAD_DIM"
-      --dtype "$DTYPE"
-      --modes "${BENCHMARK_MODES[@]}"
-    )
-
-    if [[ ${#causal_flag[@]} -gt 0 ]]; then
-      cmd+=("${causal_flag[@]}")
+    impls=("${algo_short}_func")
+    if [[ "$HAS_RING_FLASH_ATTN" == "1" ]]; then
+      impls+=(zigzag_ring_flash_attn_func stripe_flash_attn_func ring_flash_attn_func)
     fi
 
-    echo ">>> Running: ${cmd[*]}"
-    set +e
-    "${cmd[@]}" 2>&1 | tee "$log_file"
-    cmd_status=${PIPESTATUS[0]}
-    set -e
+    for mode in "${BENCHMARK_MODES[@]}"; do
+      for impl in "${impls[@]}"; do
+        log_file="$OUT_DIR/raw/${algo}.impl${impl}.mode${mode}.b${BATCH_SIZE}.s${seqlen}.h${NUM_HEADS}.d${HEAD_DIM}.dtype${DTYPE}.log"
 
-    append_results_from_log "$log_file"
+        cmd=(
+          torchrun
+          --standalone
+          --nproc_per_node="$NPROC"
+          benchmark/benchmark_ringX_func.py
+          --module "$algo"
+          --impl "$impl"
+          --batch_size "$BATCH_SIZE"
+          --num_iter "$NUM_ITER"
+          --seq_length "$seqlen"
+          --num_heads "$NUM_HEADS"
+          --head_dim "$HEAD_DIM"
+          --dtype "$DTYPE"
+          --modes "$mode"
+        )
 
-    if [[ $cmd_status -ne 0 ]]; then
-      python - "$OUT_DIR/summary.csv" "$algo" "$BATCH_SIZE" "$seqlen" "$NUM_HEADS" "$HEAD_DIM" "$DTYPE" "$NPROC" "$log_file" "$cmd_status" "$BACKEND" <<'PY'
+        if [[ ${#causal_flag[@]} -gt 0 ]]; then
+          cmd+=("${causal_flag[@]}")
+        fi
+
+        echo ">>> Running: ${cmd[*]}"
+        set +e
+        "${cmd[@]}" 2>&1 | tee "$log_file"
+        cmd_status=${PIPESTATUS[0]}
+        set -e
+
+        append_results_from_log "$log_file"
+
+        if [[ $cmd_status -ne 0 ]] && ! grep -q '^BENCHMARK_RESULT ' "$log_file"; then
+          python - "$OUT_DIR/summary.csv" "$algo" "$impl" "$mode" "$BATCH_SIZE" "$seqlen" "$NUM_HEADS" "$HEAD_DIM" "$DTYPE" "$NPROC" "$log_file" "$cmd_status" "$BACKEND" <<'PY'
 import csv
 import sys
-summary_file, algo, batch, seqlen, num_heads, head_dim, dtype, ngpus, log_file, status, backend = sys.argv[1:]
+summary_file, algo, impl, mode, batch, seqlen, num_heads, head_dim, dtype, ngpus, log_file, status, backend = sys.argv[1:]
 with open(summary_file, "a", newline="", encoding="utf-8") as handle:
     csv.writer(handle).writerow([
         algo,
-        "",
-        "",
+        impl,
+        mode,
         "failed",
         backend or "auto",
         "",
@@ -168,10 +185,12 @@ with open(summary_file, "a", newline="", encoding="utf-8") as handle:
         log_file,
     ])
 PY
-      if [[ "$STOP_ON_ERROR" == "1" ]]; then
-        exit "$cmd_status"
-      fi
-    fi
+          if [[ "$STOP_ON_ERROR" == "1" ]]; then
+            exit "$cmd_status"
+          fi
+        fi
+      done
+    done
   done
 done
 
