@@ -20,30 +20,38 @@ _VALID_BACKENDS = {"auto", "flash_attn", "fused", "portable"}
 _BACKEND = os.environ.get("RINGX_ATTN_BACKEND", "auto")
 
 _FUSED_MODULE = None
-_FUSED_ATTN = None
+_FUSED_API = None
 _FUSED_IMPORT_ERROR = None
 
 
 def _load_fused_module():
-    global _FUSED_MODULE, _FUSED_ATTN, _FUSED_IMPORT_ERROR
+    global _FUSED_MODULE, _FUSED_API, _FUSED_IMPORT_ERROR
     if _FUSED_MODULE is not None:
         return _FUSED_MODULE
     if _FUSED_IMPORT_ERROR is not None:
         return None
 
     try:
-        _FUSED_MODULE = importlib.import_module("ringX_attn.fused_attention")
-        _FUSED_ATTN = _FUSED_MODULE.attention
+        module = importlib.import_module("ringX_attn.fused_attention")
+        get_api = getattr(module, "get_backend_api", None)
+        if get_api is not None:
+            api = get_api()
+        else:
+            api = getattr(module, "FUSED_BACKEND_API", None)
+        if api is None:
+            raise RuntimeError("the optional Triton fused attention module does not expose a backend API.")
+        _FUSED_MODULE = module
+        _FUSED_API = api
     except Exception as exc:
         _FUSED_IMPORT_ERROR = exc
         _FUSED_MODULE = None
-        _FUSED_ATTN = None
+        _FUSED_API = None
     return _FUSED_MODULE
 
 
-def _load_fused_attn():
+def _load_fused_api():
     module = _load_fused_module()
-    return None if module is None else _FUSED_ATTN
+    return None if module is None else _FUSED_API
 
 
 def _fused_import_error_message() -> str:
@@ -60,15 +68,10 @@ def _fused_support_error(
     window_size=(-1, -1),
     alibi_slopes=None,
 ) -> Optional[str]:
-    module = _load_fused_module()
-    if module is None:
+    api = _load_fused_api()
+    if api is None:
         return _fused_import_error_message()
-    support_fn = getattr(module, "forward_support_error", None)
-    if support_fn is None:
-        support_fn = getattr(module, "support_error", None)
-    if support_fn is None:
-        return "the optional Triton fused attention module does not expose forward_support_error()."
-    return support_fn(
+    return api.forward_support_error(
         q,
         k,
         v,
@@ -89,13 +92,10 @@ def _fused_backward_support_error(
     window_size=(-1, -1),
     alibi_slopes=None,
 ) -> Optional[str]:
-    module = _load_fused_module()
-    if module is None:
+    api = _load_fused_api()
+    if api is None:
         return _fused_import_error_message()
-    support_fn = getattr(module, "backward_support_error", None)
-    if support_fn is None:
-        return "the optional Triton fused attention module does not expose backward_support_error()."
-    return support_fn(
+    return api.backward_support_error(
         dout,
         q,
         k,
@@ -194,7 +194,7 @@ def resolve_backend(backend: Optional[str] = None) -> str:
     if selected == "auto":
         if HAS_FLASH_ATTN:
             return "flash_attn"
-        if _load_fused_attn() is not None:
+        if _load_fused_api() is not None:
             return "fused"
         return "portable"
     if selected == "flash_attn" and not HAS_FLASH_ATTN:
@@ -203,7 +203,7 @@ def resolve_backend(backend: Optional[str] = None) -> str:
             "Use backend='portable', call set_backend('portable'), or set "
             "RINGX_ATTN_BACKEND=portable."
         )
-    if selected == "fused" and _load_fused_attn() is None:
+    if selected == "fused" and _load_fused_api() is None:
         raise RuntimeError(
             "backend='fused' was requested, but "
             f"{_fused_import_error_message()} "
@@ -214,7 +214,7 @@ def resolve_backend(backend: Optional[str] = None) -> str:
 
 def available_backends():
     backends = ["portable"]
-    if _load_fused_attn() is not None:
+    if _load_fused_api() is not None:
         backends.append("fused")
     if HAS_FLASH_ATTN:
         backends.append("flash_attn")
@@ -366,13 +366,13 @@ def _fused_forward(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    fused_attn = _load_fused_attn()
-    assert fused_attn is not None
+    fused_api = _load_fused_api()
+    assert fused_api is not None
 
     qh = q.permute(0, 2, 1, 3).contiguous()
     kh = k.permute(0, 2, 1, 3).contiguous()
     vh = v.permute(0, 2, 1, 3).contiguous()
-    out, lse = fused_attn(qh, kh, vh, causal, softmax_scale)
+    out, lse = fused_api.forward(qh, kh, vh, causal, softmax_scale)
     out = out.permute(0, 2, 1, 3).contiguous()
     return out.to(q.dtype), lse.contiguous()
 
@@ -409,8 +409,8 @@ def _fused_backward(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    fused_module = _load_fused_module()
-    assert fused_module is not None
+    fused_api = _load_fused_api()
+    assert fused_api is not None
 
     qh = q.permute(0, 2, 1, 3).contiguous()
     kh = k.permute(0, 2, 1, 3).contiguous()
@@ -419,7 +419,7 @@ def _fused_backward(
     outh = out.permute(0, 2, 1, 3).contiguous()
     lse = softmax_lse.contiguous()
 
-    dqh, dkh, dvh = fused_module.attention_backward(
+    dqh, dkh, dvh = fused_api.backward(
         qh,
         kh,
         vh,

@@ -27,6 +27,7 @@ Tensor layout: (batch, heads, seqlen, head_dim)
   NOTE: ringX_attn uses (batch, seqlen, heads, head_dim) — transpose at call site.
 """
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -216,6 +217,47 @@ def supports_attention_call(*args, **kwargs) -> bool:
 
 def supports_backward_call(*args, **kwargs) -> bool:
     return backward_support_error(*args, **kwargs) is None
+
+
+@dataclass(frozen=True)
+class FusedAttentionAPI:
+    """Public API bundle for the Triton fused backend.
+
+    Keeping the contract behind a single exported object lets callers depend on
+    one stable surface instead of probing individual functions and constants.
+    """
+
+    supported_dtypes: frozenset = SUPPORTED_DTYPES
+    supported_head_dims: frozenset = SUPPORTED_HEAD_DIMS
+    required_sequence_multiple: int = REQUIRED_SEQUENCE_MULTIPLE
+    expected_lse_dtype: torch.dtype = EXPECTED_LSE_DTYPE
+    active_triton_backend: str = ACTIVE_TRITON_BACKEND
+    active_torch_device_type: str = ACTIVE_TORCH_DEVICE_TYPE
+
+    def forward_support_error(self, *args, **kwargs) -> Optional[str]:
+        return forward_support_error(*args, **kwargs)
+
+    def backward_support_error(self, *args, **kwargs) -> Optional[str]:
+        return backward_support_error(*args, **kwargs)
+
+    def supports_attention_call(self, *args, **kwargs) -> bool:
+        return supports_attention_call(*args, **kwargs)
+
+    def supports_backward_call(self, *args, **kwargs) -> bool:
+        return supports_backward_call(*args, **kwargs)
+
+    def forward(self, *args, **kwargs):
+        return attention(*args, **kwargs)
+
+    def backward(self, *args, **kwargs):
+        return attention_backward(*args, **kwargs)
+
+
+FUSED_BACKEND_API = FusedAttentionAPI()
+
+
+def get_backend_api() -> FusedAttentionAPI:
+    return FUSED_BACKEND_API
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +821,26 @@ def attention_backward(q, k, v, o, M, do, causal, sm_scale):
 
 
 attention = _attention.apply
+
+__all__ = [
+    "ACTIVE_TORCH_DEVICE_TYPE",
+    "ACTIVE_TRITON_BACKEND",
+    "EXPECTED_LSE_DTYPE",
+    "FUSED_BACKEND_API",
+    "FusedAttentionAPI",
+    "HAS_FLASH",
+    "REQUIRED_SEQUENCE_MULTIPLE",
+    "SUPPORTED_DTYPES",
+    "SUPPORTED_HEAD_DIMS",
+    "attention",
+    "attention_backward",
+    "backward_support_error",
+    "forward_support_error",
+    "get_backend_api",
+    "support_error",
+    "supports_attention_call",
+    "supports_backward_call",
+]
 
 
 # ---------------------------------------------------------------------------

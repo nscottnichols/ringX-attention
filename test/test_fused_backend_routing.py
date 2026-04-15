@@ -56,7 +56,7 @@ def test_auto_uses_fused_when_available_and_supported():
     with patched_attrs(
         backend,
         HAS_FLASH_ATTN=False,
-        _load_fused_attn=lambda: object(),
+        _load_fused_api=lambda: object(),
         _fused_support_error=lambda *args, **kwargs: None,
         _fused_forward=lambda *args, **kwargs: (fused_out, fused_lse),
         _portable_forward=_portable_should_not_run,
@@ -78,7 +78,7 @@ def test_auto_falls_back_to_portable_when_fused_is_unsupported():
     with patched_attrs(
         backend,
         HAS_FLASH_ATTN=False,
-        _load_fused_attn=lambda: object(),
+        _load_fused_api=lambda: object(),
         _fused_support_error=lambda *args, **kwargs: "fused backend does not support local window attention.",
         _fused_forward=_fused_should_not_run,
         _portable_forward=lambda *args, **kwargs: (portable_out, portable_lse),
@@ -95,9 +95,7 @@ def test_backend_delegates_support_checks_to_fused_module():
     portable_lse = torch.full((q.shape[0], q.shape[2], q.shape[1]), 6.0)
     calls = {}
 
-    class _FakeFusedModule:
-        attention = object()
-
+    class _FakeFusedAPI:
         def forward_support_error(self, q_, k_, v_, dropout_p=0.0, window_size=(-1, -1), alibi_slopes=None):
             calls["shapes"] = (q_.shape, k_.shape, v_.shape)
             calls["dtype"] = q_.dtype
@@ -110,8 +108,7 @@ def test_backend_delegates_support_checks_to_fused_module():
     with patched_attrs(
         backend,
         HAS_FLASH_ATTN=False,
-        _load_fused_module=lambda: _FakeFusedModule(),
-        _load_fused_attn=lambda: object(),
+        _load_fused_api=lambda: _FakeFusedAPI(),
         _portable_forward=lambda *args, **kwargs: (portable_out, portable_lse),
     ):
         out, lse = backend.local_attn_forward(
@@ -138,7 +135,7 @@ def test_explicit_fused_raises_for_unsupported_call():
 
     with patched_attrs(
         backend,
-        _load_fused_attn=lambda: object(),
+        _load_fused_api=lambda: object(),
         _fused_support_error=lambda *args, **kwargs: "fused backend does not support local window attention.",
     ):
         try:
@@ -157,8 +154,8 @@ def test_fused_backward_uses_public_wrapper():
 
     calls = {}
 
-    class _FakeFusedModule:
-        def attention_backward(self, qh, kh, vh, outh, lseh, douth, causal, sm_scale):
+    class _FakeFusedAPI:
+        def backward(self, qh, kh, vh, outh, lseh, douth, causal, sm_scale):
             calls["shapes"] = (qh.shape, kh.shape, vh.shape, outh.shape, lseh.shape, douth.shape)
             calls["causal"] = causal
             calls["sm_scale"] = sm_scale
@@ -166,8 +163,7 @@ def test_fused_backward_uses_public_wrapper():
 
     with patched_attrs(
         backend,
-        _load_fused_attn=lambda: object(),
-        _load_fused_module=lambda: _FakeFusedModule(),
+        _load_fused_api=lambda: _FakeFusedAPI(),
         _fused_backward_support_error=lambda *args, **kwargs: None,
     ):
         dq, dk, dv = backend.local_attn_backward(
@@ -199,9 +195,7 @@ def test_backend_delegates_backward_support_checks_to_fused_module():
     portable_grads = tuple(torch.full_like(tensor, fill_value) for tensor, fill_value in ((q, 17.0), (k, 19.0), (v, 23.0)))
     calls = {}
 
-    class _FakeFusedModule:
-        attention = object()
-
+    class _FakeFusedAPI:
         def backward_support_error(
             self,
             dout_,
@@ -226,8 +220,7 @@ def test_backend_delegates_backward_support_checks_to_fused_module():
     with patched_attrs(
         backend,
         HAS_FLASH_ATTN=False,
-        _load_fused_module=lambda: _FakeFusedModule(),
-        _load_fused_attn=lambda: object(),
+        _load_fused_api=lambda: _FakeFusedAPI(),
         _portable_backward=lambda *args, **kwargs: portable_grads,
     ):
         dq, dk, dv = backend.local_attn_backward(
@@ -263,7 +256,7 @@ def test_explicit_fused_backward_raises_for_unsupported_call():
 
     with patched_attrs(
         backend,
-        _load_fused_attn=lambda: object(),
+        _load_fused_api=lambda: object(),
         _fused_backward_support_error=lambda *args, **kwargs: "fused backend currently supports dropout_p=0 only.",
     ):
         try:
@@ -306,7 +299,7 @@ if __name__ == "__main__":
 
     test_fused_backward_uses_public_wrapper()
     if rank == 0:
-        print("[ok] fused backward uses the public fused module wrapper", flush=True)
+        print("[ok] fused backward uses the public fused backend API wrapper", flush=True)
 
     test_backend_delegates_backward_support_checks_to_fused_module()
     if rank == 0:
@@ -319,3 +312,4 @@ if __name__ == "__main__":
     _barrier()
     if initialized:
         dist.destroy_process_group()
+
