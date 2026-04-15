@@ -50,7 +50,7 @@ Each `ringX*_attn_func(...)` call also accepts `backend=None | "flash_attn" | "f
 Current backend limitations:
 
 - `portable`: `dropout_p` must be `0`, and `alibi_slopes` is not supported
-- `fused`: requires Triton, `dropout_p=0`, `window_size=(-1, -1)`, equal Q/K/V sequence lengths, a sequence length divisible by `128`, and `head_dim` in `{16, 32, 64, 128, 256}`
+- `fused`: requires Triton, Q/K/V on the same active Triton device type and dtype, `dropout_p=0`, `window_size=(-1, -1)`, equal Q/K/V sequence lengths, a sequence length divisible by `128`, and `head_dim` in `{16, 32, 64, 128, 256}`
 - when `backend="auto"`, unsupported fused calls fall back to `portable` automatically
 
 Portable backend tuning:
@@ -151,4 +151,3 @@ If you find this work helpful in your research or applications, please consider 
       year={2026},
 }
 ``` 
-
