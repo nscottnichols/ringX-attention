@@ -194,7 +194,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 
 
 @triton.autotune(configs=list(filter(keep, configs)),
-                 key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+                 key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,
@@ -203,11 +203,12 @@ def _attn_fwd(sm_scale, M,
               BLOCK_M: tl.constexpr,
               BLOCK_N: tl.constexpr,
               FP8_OUTPUT: tl.constexpr,
+              USE_BF16: tl.constexpr,
               STAGE: tl.constexpr,
               warp_specialize: tl.constexpr,
               IS_HOPPER: tl.constexpr,
               ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
+    dtype = tl.float8e5 if FP8_OUTPUT else (tl.bfloat16 if USE_BF16 else tl.float16)
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -287,6 +288,7 @@ def _attn_bwd_dkdv(dk, dv,
                    H, N_CTX, BLOCK_M1: tl.constexpr,
                    BLOCK_N1: tl.constexpr,
                    HEAD_DIM: tl.constexpr,
+                   MATMUL_BF16: tl.constexpr,
                    start_n, start_m, num_steps,
                    MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
@@ -295,6 +297,7 @@ def _attn_bwd_dkdv(dk, dv,
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
+    matmul_dtype = tl.bfloat16 if MATMUL_BF16 else tl.float16
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
@@ -308,12 +311,12 @@ def _attn_bwd_dkdv(dk, dv,
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs)
         ppT = pT
-        ppT = ppT.to(tl.float16)
+        ppT = ppT.to(matmul_dtype)
         dv += tl.dot(ppT, do)
         Di = tl.load(D + offs_m)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
+        dsT = dsT.to(matmul_dtype)
         dk += tl.dot(dsT, tl.trans(qT))
         curr_m += step_m
         qT_ptrs += step_m * stride_tok
@@ -329,6 +332,7 @@ def _attn_bwd_dq(dq, q, K, V,
                  BLOCK_M2: tl.constexpr,
                  BLOCK_N2: tl.constexpr,
                  HEAD_DIM: tl.constexpr,
+                 MATMUL_BF16: tl.constexpr,
                  start_m, start_n, num_steps,
                  MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
@@ -338,6 +342,7 @@ def _attn_bwd_dq(dq, q, K, V,
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     Di = tl.load(D + offs_m)
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
+    matmul_dtype = tl.bfloat16 if MATMUL_BF16 else tl.float16
     curr_n = start_n
     step_n = BLOCK_N2
     for blk_idx in range(num_steps):
@@ -351,7 +356,7 @@ def _attn_bwd_dq(dq, q, K, V,
             p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
+        ds = ds.to(matmul_dtype)
         dq += tl.dot(ds, tl.trans(kT))
         curr_n += step_n
         kT_ptrs += step_n * stride_tok
@@ -538,6 +543,7 @@ class _attention(torch.autograd.Function):
             N_CTX=q.shape[2],
             HEAD_DIM=HEAD_DIM_K,
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+            USE_BF16=q.dtype == torch.bfloat16,
             STAGE=stage,
             warp_specialize=warp_specialize,
             IS_HOPPER=is_hopper(),
@@ -591,6 +597,7 @@ class _attention(torch.autograd.Function):
             BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=ctx.HEAD_DIM,
+            MATMUL_BF16=q.dtype == torch.bfloat16,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             CAUSAL=ctx.causal,
