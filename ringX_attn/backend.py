@@ -1,7 +1,8 @@
 import importlib
 import math
 import os
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -17,11 +18,52 @@ except ImportError:
     HAS_FLASH_ATTN = False
 
 _VALID_BACKENDS = {"auto", "flash_attn", "fused", "portable"}
+_BACKEND_PRIORITY = ("flash_attn", "fused", "portable")
 _BACKEND = os.environ.get("RINGX_ATTN_BACKEND", "auto")
 
 _FUSED_MODULE = None
 _FUSED_API = None
 _FUSED_IMPORT_ERROR = None
+
+
+@dataclass(frozen=True)
+class _ForwardCall:
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    softmax_scale: Optional[float]
+    dropout_p: float = 0.0
+    causal: bool = False
+    window_size: Tuple[int, int] = (-1, -1)
+    alibi_slopes: Optional[torch.Tensor] = None
+    deterministic: bool = False
+
+
+@dataclass(frozen=True)
+class _BackwardCall:
+    dout: torch.Tensor
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    out: torch.Tensor
+    softmax_lse: torch.Tensor
+    softmax_scale: Optional[float]
+    dropout_p: float = 0.0
+    causal: bool = False
+    window_size: Tuple[int, int] = (-1, -1)
+    alibi_slopes: Optional[torch.Tensor] = None
+    deterministic: bool = False
+
+
+@dataclass(frozen=True)
+class _BackendAdapter:
+    name: str
+    available: Callable[[], bool]
+    unavailable_error: Optional[Callable[[], str]]
+    forward: Callable[[_ForwardCall], Tuple[torch.Tensor, torch.Tensor]]
+    backward: Callable[[_BackwardCall], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    forward_support_error: Optional[Callable[[_ForwardCall], Optional[str]]] = None
+    backward_support_error: Optional[Callable[[_BackwardCall], Optional[str]]] = None
 
 
 def _load_fused_module():
@@ -108,72 +150,37 @@ def _fused_backward_support_error(
     )
 
 
-def _resolve_fused_runtime_backend(requested: str, fused_error: Optional[str]) -> str:
-    if fused_error is None:
-        return "fused"
+def _requested_backend_name(backend: Optional[str]) -> str:
+    return _BACKEND if backend is None else backend
+
+
+
+def _resolve_runtime_backend(requested: str, adapter: _BackendAdapter, support_error: Optional[str]) -> _BackendAdapter:
+    if support_error is None:
+        return adapter
     if requested == "auto":
-        return "portable"
+        return _BACKEND_ADAPTERS["portable"]
     raise RuntimeError(
-        "backend='fused' was requested, but the current attention call is not supported: "
-        f"{fused_error} Use backend='portable', call set_backend('portable'), or set "
+        f"backend='{adapter.name}' was requested, but the current attention call is not supported: "
+        f"{support_error} Use backend='portable', call set_backend('portable'), or set "
         "RINGX_ATTN_BACKEND=portable."
     )
 
 
-def _runtime_backend(
-    backend: Optional[str],
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p=0.0,
-    window_size=(-1, -1),
-    alibi_slopes=None,
-) -> str:
-    requested = _BACKEND if backend is None else backend
-    selected = resolve_backend(backend)
-    if selected != "fused":
-        return selected
 
-    fused_error = _fused_support_error(
-        q,
-        k,
-        v,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        alibi_slopes=alibi_slopes,
-    )
-    return _resolve_fused_runtime_backend(requested, fused_error)
+def _forward_runtime_adapter(backend: Optional[str], call: _ForwardCall) -> _BackendAdapter:
+    requested = _requested_backend_name(backend)
+    adapter = _BACKEND_ADAPTERS[resolve_backend(backend)]
+    support_error = None if adapter.forward_support_error is None else adapter.forward_support_error(call)
+    return _resolve_runtime_backend(requested, adapter, support_error)
 
 
-def _runtime_backward_backend(
-    backend: Optional[str],
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dropout_p=0.0,
-    window_size=(-1, -1),
-    alibi_slopes=None,
-) -> str:
-    requested = _BACKEND if backend is None else backend
-    selected = resolve_backend(backend)
-    if selected != "fused":
-        return selected
 
-    fused_error = _fused_backward_support_error(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        alibi_slopes=alibi_slopes,
-    )
-    return _resolve_fused_runtime_backend(requested, fused_error)
+def _backward_runtime_adapter(backend: Optional[str], call: _BackwardCall) -> _BackendAdapter:
+    requested = _requested_backend_name(backend)
+    adapter = _BACKEND_ADAPTERS[resolve_backend(backend)]
+    support_error = None if adapter.backward_support_error is None else adapter.backward_support_error(call)
+    return _resolve_runtime_backend(requested, adapter, support_error)
 
 
 def set_backend(backend: str) -> None:
@@ -188,37 +195,36 @@ def get_backend() -> str:
 
 
 def resolve_backend(backend: Optional[str] = None) -> str:
-    selected = _BACKEND if backend is None else backend
+    selected = _requested_backend_name(backend)
     if selected not in _VALID_BACKENDS:
         raise ValueError(f"Unsupported backend '{selected}'. Expected one of {_VALID_BACKENDS}.")
     if selected == "auto":
-        if HAS_FLASH_ATTN:
-            return "flash_attn"
-        if _load_fused_api() is not None:
-            return "fused"
+        for name in _BACKEND_PRIORITY:
+            if _BACKEND_ADAPTERS[name].available():
+                return name
         return "portable"
-    if selected == "flash_attn" and not HAS_FLASH_ATTN:
-        raise RuntimeError(
-            "backend='flash_attn' was requested, but flash_attn is not installed. "
-            "Use backend='portable', call set_backend('portable'), or set "
-            "RINGX_ATTN_BACKEND=portable."
-        )
-    if selected == "fused" and _load_fused_api() is None:
-        raise RuntimeError(
-            "backend='fused' was requested, but "
-            f"{_fused_import_error_message()} "
-            "Install Triton support for this environment, or use backend='portable'."
-        )
-    return selected
+
+    adapter = _BACKEND_ADAPTERS[selected]
+    if adapter.available():
+        return selected
+
+    unavailable_error = "backend is not available."
+    if adapter.unavailable_error is not None:
+        unavailable_error = adapter.unavailable_error()
+    raise RuntimeError(
+        f"backend='{selected}' was requested, but {unavailable_error} "
+        "Use backend='portable', call set_backend('portable'), or set "
+        "RINGX_ATTN_BACKEND=portable."
+    )
+
 
 
 def available_backends():
-    backends = ["portable"]
-    if _load_fused_api() is not None:
-        backends.append("fused")
-    if HAS_FLASH_ATTN:
-        backends.append("flash_attn")
-    return tuple(backends)
+    return tuple(
+        name
+        for name in ("portable", "fused", "flash_attn")
+        if _BACKEND_ADAPTERS[name].available()
+    )
 
 
 def _build_local_mask(
@@ -341,6 +347,20 @@ def _flash_backward(
     return dq, dk, dv
 
 
+def _resolve_softmax_scale(softmax_scale: Optional[float], head_dim: int) -> float:
+    return head_dim ** (-0.5) if softmax_scale is None else softmax_scale
+
+
+
+def _to_head_first_layout(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.permute(0, 2, 1, 3).contiguous()
+
+
+
+def _to_seq_first_layout(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.permute(0, 2, 1, 3).contiguous()
+
+
 def _fused_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -363,17 +383,16 @@ def _fused_forward(
     if error is not None:
         raise RuntimeError(f"Unable to run fused backend: {error}")
 
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
+    softmax_scale = _resolve_softmax_scale(softmax_scale, q.shape[-1])
 
     fused_api = _load_fused_api()
     assert fused_api is not None
 
-    qh = q.permute(0, 2, 1, 3).contiguous()
-    kh = k.permute(0, 2, 1, 3).contiguous()
-    vh = v.permute(0, 2, 1, 3).contiguous()
+    qh = _to_head_first_layout(q)
+    kh = _to_head_first_layout(k)
+    vh = _to_head_first_layout(v)
     out, lse = fused_api.forward(qh, kh, vh, causal, softmax_scale)
-    out = out.permute(0, 2, 1, 3).contiguous()
+    out = _to_seq_first_layout(out)
     return out.to(q.dtype), lse.contiguous()
 
 
@@ -406,17 +425,16 @@ def _fused_backward(
     if error is not None:
         raise RuntimeError(f"Unable to run fused backend: {error}")
 
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
+    softmax_scale = _resolve_softmax_scale(softmax_scale, q.shape[-1])
 
     fused_api = _load_fused_api()
     assert fused_api is not None
 
-    qh = q.permute(0, 2, 1, 3).contiguous()
-    kh = k.permute(0, 2, 1, 3).contiguous()
-    vh = v.permute(0, 2, 1, 3).contiguous()
-    douth = dout.permute(0, 2, 1, 3).contiguous()
-    outh = out.permute(0, 2, 1, 3).contiguous()
+    qh = _to_head_first_layout(q)
+    kh = _to_head_first_layout(k)
+    vh = _to_head_first_layout(v)
+    douth = _to_head_first_layout(dout)
+    outh = _to_head_first_layout(out)
     lse = softmax_lse.contiguous()
 
     dqh, dkh, dvh = fused_api.backward(
@@ -429,9 +447,9 @@ def _fused_backward(
         causal=causal,
         sm_scale=softmax_scale,
     )
-    dq = dqh.permute(0, 2, 1, 3).contiguous().to(q.dtype)
-    dk = dkh.permute(0, 2, 1, 3).contiguous().to(k.dtype)
-    dv = dvh.permute(0, 2, 1, 3).contiguous().to(v.dtype)
+    dq = _to_seq_first_layout(dqh).to(q.dtype)
+    dk = _to_seq_first_layout(dkh).to(k.dtype)
+    dv = _to_seq_first_layout(dvh).to(v.dtype)
     return dq, dk, dv
 
 
@@ -619,6 +637,185 @@ def _portable_backward(
     return dq, dk, dv
 
 
+def _flash_is_available() -> bool:
+    return HAS_FLASH_ATTN
+
+
+
+def _flash_unavailable_error() -> str:
+    return "flash_attn is not installed."
+
+
+
+def _flash_adapter_forward(call: _ForwardCall):
+    return _flash_forward(
+        call.q,
+        call.k,
+        call.v,
+        softmax_scale=call.softmax_scale,
+        dropout_p=call.dropout_p,
+        causal=call.causal,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+        deterministic=call.deterministic,
+    )
+
+
+
+def _flash_adapter_backward(call: _BackwardCall):
+    return _flash_backward(
+        call.dout,
+        call.q,
+        call.k,
+        call.v,
+        call.out,
+        call.softmax_lse,
+        softmax_scale=call.softmax_scale,
+        dropout_p=call.dropout_p,
+        causal=call.causal,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+        deterministic=call.deterministic,
+    )
+
+
+
+def _fused_is_available() -> bool:
+    return _load_fused_api() is not None
+
+
+
+def _fused_unavailable_error() -> str:
+    return f"{_fused_import_error_message()} Install Triton support for this environment, or use backend='portable'."
+
+
+
+def _fused_adapter_forward_support_error(call: _ForwardCall) -> Optional[str]:
+    return _fused_support_error(
+        call.q,
+        call.k,
+        call.v,
+        dropout_p=call.dropout_p,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+    )
+
+
+
+def _fused_adapter_backward_support_error(call: _BackwardCall) -> Optional[str]:
+    return _fused_backward_support_error(
+        call.dout,
+        call.q,
+        call.k,
+        call.v,
+        call.out,
+        call.softmax_lse,
+        dropout_p=call.dropout_p,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+    )
+
+
+
+def _fused_adapter_forward(call: _ForwardCall):
+    return _fused_forward(
+        call.q,
+        call.k,
+        call.v,
+        softmax_scale=call.softmax_scale,
+        dropout_p=call.dropout_p,
+        causal=call.causal,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+        deterministic=call.deterministic,
+    )
+
+
+
+def _fused_adapter_backward(call: _BackwardCall):
+    return _fused_backward(
+        call.dout,
+        call.q,
+        call.k,
+        call.v,
+        call.out,
+        call.softmax_lse,
+        softmax_scale=call.softmax_scale,
+        dropout_p=call.dropout_p,
+        causal=call.causal,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+        deterministic=call.deterministic,
+    )
+
+
+
+def _portable_is_available() -> bool:
+    return True
+
+
+
+def _portable_adapter_forward(call: _ForwardCall):
+    return _portable_forward(
+        call.q,
+        call.k,
+        call.v,
+        softmax_scale=call.softmax_scale,
+        dropout_p=call.dropout_p,
+        causal=call.causal,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+        deterministic=call.deterministic,
+    )
+
+
+
+def _portable_adapter_backward(call: _BackwardCall):
+    return _portable_backward(
+        call.dout,
+        call.q,
+        call.k,
+        call.v,
+        call.out,
+        call.softmax_lse,
+        softmax_scale=call.softmax_scale,
+        dropout_p=call.dropout_p,
+        causal=call.causal,
+        window_size=call.window_size,
+        alibi_slopes=call.alibi_slopes,
+        deterministic=call.deterministic,
+    )
+
+
+
+_BACKEND_ADAPTERS: Dict[str, _BackendAdapter] = {
+    "flash_attn": _BackendAdapter(
+        name="flash_attn",
+        available=_flash_is_available,
+        unavailable_error=_flash_unavailable_error,
+        forward=_flash_adapter_forward,
+        backward=_flash_adapter_backward,
+    ),
+    "fused": _BackendAdapter(
+        name="fused",
+        available=_fused_is_available,
+        unavailable_error=_fused_unavailable_error,
+        forward=_fused_adapter_forward,
+        backward=_fused_adapter_backward,
+        forward_support_error=_fused_adapter_forward_support_error,
+        backward_support_error=_fused_adapter_backward_support_error,
+    ),
+    "portable": _BackendAdapter(
+        name="portable",
+        available=_portable_is_available,
+        unavailable_error=None,
+        forward=_portable_adapter_forward,
+        backward=_portable_adapter_backward,
+    ),
+}
+
+
+
 def local_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -631,43 +828,10 @@ def local_attn_forward(
     deterministic=False,
     backend: Optional[str] = None,
 ):
-    selected = _runtime_backend(
-        backend,
-        q,
-        k,
-        v,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        alibi_slopes=alibi_slopes,
-    )
-    if selected == "flash_attn":
-        return _flash_forward(
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-        )
-    if selected == "fused":
-        return _fused_forward(
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-        )
-    return _portable_forward(
-        q,
-        k,
-        v,
+    call = _ForwardCall(
+        q=q,
+        k=k,
+        v=v,
         softmax_scale=softmax_scale,
         dropout_p=dropout_p,
         causal=causal,
@@ -675,6 +839,8 @@ def local_attn_forward(
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
     )
+    return _forward_runtime_adapter(backend, call).forward(call)
+
 
 
 def local_attn_backward(
@@ -692,55 +858,13 @@ def local_attn_backward(
     deterministic=False,
     backend: Optional[str] = None,
 ):
-    selected = _runtime_backward_backend(
-        backend,
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        alibi_slopes=alibi_slopes,
-    )
-    if selected == "flash_attn":
-        return _flash_backward(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-        )
-    if selected == "fused":
-        return _fused_backward(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-        )
-    return _portable_backward(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
+    call = _BackwardCall(
+        dout=dout,
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        softmax_lse=softmax_lse,
         softmax_scale=softmax_scale,
         dropout_p=dropout_p,
         causal=causal,
@@ -748,3 +872,4 @@ def local_attn_backward(
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
     )
+    return _backward_runtime_adapter(backend, call).backward(call)
