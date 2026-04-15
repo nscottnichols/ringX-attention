@@ -27,6 +27,8 @@ Tensor layout: (batch, heads, seqlen, head_dim)
   NOTE: ringX_attn uses (batch, seqlen, heads, head_dim) — transpose at call site.
 """
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -67,6 +69,66 @@ def is_blackwell():
 
 def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
+
+
+SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
+SUPPORTED_HEAD_DIMS = frozenset({16, 32, 64, 128, 256})
+REQUIRED_SEQUENCE_MULTIPLE = 128
+ACTIVE_TRITON_BACKEND = triton.runtime.driver.active.get_current_target().backend
+ACTIVE_TORCH_DEVICE_TYPE = DEVICE.type
+
+
+def support_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    """Validate a ringX backend attention call before dispatching the Triton kernel.
+
+    This integration hook expects tensors in ringX's local-attention layout
+    ``(batch, seqlen, heads, head_dim)``. The actual Triton kernel entry point
+    still consumes ``(batch, heads, seqlen, head_dim)`` after the caller
+    permutes the tensors.
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return "fused backend expects q, k, and v to be 4D tensors with shape (batch, seqlen, heads, head_dim)."
+    if q.device != k.device or q.device != v.device:
+        return "fused backend requires q, k, and v to be on the same device."
+    if q.device.type != ACTIVE_TORCH_DEVICE_TYPE:
+        return (
+            "fused backend requires tensors on the active Triton device type "
+            f"'{ACTIVE_TORCH_DEVICE_TYPE}' (current Triton backend: {ACTIVE_TRITON_BACKEND})."
+        )
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        return "fused backend requires q, k, and v to share the same dtype."
+    if q.dtype not in SUPPORTED_DTYPES:
+        supported = ", ".join(sorted(str(dtype).replace("torch.", "") for dtype in SUPPORTED_DTYPES))
+        return f"fused backend currently supports {supported} tensors only."
+    if dropout_p != 0:
+        return "fused backend currently supports dropout_p=0 only."
+    if alibi_slopes is not None:
+        return "fused backend does not support alibi_slopes."
+    if window_size != (-1, -1):
+        return "fused backend does not support local window attention."
+    if q.shape[:3] != k.shape[:3] or q.shape[:3] != v.shape[:3]:
+        return "fused backend requires q, k, and v to share the same batch, sequence, and head dimensions."
+    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        return "fused backend requires q, k, and v to share the same head dimension."
+    if q.shape[-1] not in SUPPORTED_HEAD_DIMS:
+        return f"fused backend requires head_dim in {sorted(SUPPORTED_HEAD_DIMS)}."
+    if q.shape[1] % REQUIRED_SEQUENCE_MULTIPLE != 0:
+        return (
+            "fused backend currently requires sequence length to be a multiple of "
+            f"{REQUIRED_SEQUENCE_MULTIPLE}."
+        )
+    return None
+
+
+def supports_attention_call(*args, **kwargs) -> bool:
+    return support_error(*args, **kwargs) is None
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +560,7 @@ class _attention(torch.autograd.Function):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        assert HEAD_DIM_K in SUPPORTED_HEAD_DIMS
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}

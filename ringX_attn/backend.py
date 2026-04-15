@@ -22,7 +22,6 @@ _BACKEND = os.environ.get("RINGX_ATTN_BACKEND", "auto")
 _FUSED_MODULE = None
 _FUSED_ATTN = None
 _FUSED_IMPORT_ERROR = None
-_FUSED_HEAD_DIMS = {16, 32, 64, 128, 256}
 
 
 def _load_fused_module():
@@ -61,27 +60,20 @@ def _fused_support_error(
     window_size=(-1, -1),
     alibi_slopes=None,
 ) -> Optional[str]:
-    if _load_fused_attn() is None:
+    module = _load_fused_module()
+    if module is None:
         return _fused_import_error_message()
-    if q.device.type != "cuda":
-        return "fused backend requires CUDA-compatible tensors."
-    if dropout_p != 0:
-        return "fused backend currently supports dropout_p=0 only."
-    if alibi_slopes is not None:
-        return "fused backend does not support alibi_slopes."
-    if window_size != (-1, -1):
-        return "fused backend does not support local window attention."
-    if q.shape[:3] != k.shape[:3] or q.shape[:3] != v.shape[:3]:
-        return "fused backend requires q, k, and v to share the same batch, sequence, and head dimensions."
-    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
-        return "fused backend requires q, k, and v to share the same head dimension."
-    if q.shape[-1] not in _FUSED_HEAD_DIMS:
-        return f"fused backend requires head_dim in {sorted(_FUSED_HEAD_DIMS)}."
-    if q.shape[1] % 128 != 0:
-        return "fused backend currently requires sequence length to be a multiple of 128."
-    if q.dtype not in {torch.float16, torch.bfloat16}:
-        return "fused backend currently supports float16 and bfloat16 tensors only."
-    return None
+    support_fn = getattr(module, "support_error", None)
+    if support_fn is None:
+        return "the optional Triton fused attention module does not expose support_error()."
+    return support_fn(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
 
 
 def _runtime_backend(
