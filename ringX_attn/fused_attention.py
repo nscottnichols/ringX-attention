@@ -27,6 +27,9 @@ Tensor layout: (batch, heads, seqlen, head_dim)
   NOTE: ringX_attn uses (batch, seqlen, heads, head_dim) — transpose at call site.
 """
 
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -67,6 +70,194 @@ def is_blackwell():
 
 def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
+
+
+SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
+SUPPORTED_HEAD_DIMS = frozenset({16, 32, 64, 128, 256})
+REQUIRED_SEQUENCE_MULTIPLE = 128
+EXPECTED_LSE_DTYPE = torch.float32
+ACTIVE_TRITON_BACKEND = triton.runtime.driver.active.get_current_target().backend
+ACTIVE_TORCH_DEVICE_TYPE = DEVICE.type
+
+
+def _supported_dtype_names() -> str:
+    return ", ".join(sorted(str(dtype).replace("torch.", "") for dtype in SUPPORTED_DTYPES))
+
+
+def _device_error(q: torch.Tensor, *others: torch.Tensor) -> Optional[str]:
+    for tensor in others:
+        if q.device != tensor.device:
+            return "fused backend requires all attention tensors to be on the same device."
+    if q.device.type != ACTIVE_TORCH_DEVICE_TYPE:
+        return (
+            "fused backend requires tensors on the active Triton device type "
+            f"'{ACTIVE_TORCH_DEVICE_TYPE}' (current Triton backend: {ACTIVE_TRITON_BACKEND})."
+        )
+    return None
+
+
+def _qkv_support_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    dropout_p: float = 0.0,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return "fused backend expects q, k, and v to be 4D tensors with shape (batch, seqlen, heads, head_dim)."
+    device_error = _device_error(q, k, v)
+    if device_error is not None:
+        return device_error
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        return "fused backend requires q, k, and v to share the same dtype."
+    if q.dtype not in SUPPORTED_DTYPES:
+        return f"fused backend currently supports {_supported_dtype_names()} tensors only."
+    if dropout_p != 0:
+        return "fused backend currently supports dropout_p=0 only."
+    if alibi_slopes is not None:
+        return "fused backend does not support alibi_slopes."
+    if window_size != (-1, -1):
+        return "fused backend does not support local window attention."
+    if q.shape[:3] != k.shape[:3] or q.shape[:3] != v.shape[:3]:
+        return "fused backend requires q, k, and v to share the same batch, sequence, and head dimensions."
+    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        return "fused backend requires q, k, and v to share the same head dimension."
+    if q.shape[-1] not in SUPPORTED_HEAD_DIMS:
+        return f"fused backend requires head_dim in {sorted(SUPPORTED_HEAD_DIMS)}."
+    if q.shape[1] % REQUIRED_SEQUENCE_MULTIPLE != 0:
+        return (
+            "fused backend currently requires sequence length to be a multiple of "
+            f"{REQUIRED_SEQUENCE_MULTIPLE}."
+        )
+    return None
+
+
+def forward_support_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    """Validate a ringX backend forward attention call before dispatching Triton.
+
+    This integration hook expects tensors in ringX's local-attention layout
+    ``(batch, seqlen, heads, head_dim)``. The actual Triton kernel entry point
+    still consumes ``(batch, heads, seqlen, head_dim)`` after the caller
+    permutes the tensors.
+    """
+    return _qkv_support_error(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+
+
+def backward_support_error(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dropout_p: float = 0.0,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    """Validate a ringX backend backward attention call before Triton dispatch."""
+    qkv_error = _qkv_support_error(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+    if qkv_error is not None:
+        return qkv_error
+    if dout.ndim != 4 or out.ndim != 4:
+        return "fused backend expects dout and out to be 4D tensors with shape (batch, seqlen, heads, head_dim)."
+    device_error = _device_error(q, dout, out, softmax_lse)
+    if device_error is not None:
+        return device_error
+    if dout.shape != q.shape:
+        return "fused backend requires dout to have the same shape as q."
+    if out.shape != q.shape:
+        return "fused backend requires out to have the same shape as q."
+    if dout.dtype != q.dtype or out.dtype != q.dtype:
+        return "fused backend requires dout and out to share q's dtype."
+    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    if softmax_lse.ndim != 3 or softmax_lse.shape != expected_lse_shape:
+        return (
+            "fused backend requires softmax_lse to have shape "
+            f"{expected_lse_shape}."
+        )
+    if softmax_lse.dtype != EXPECTED_LSE_DTYPE:
+        return (
+            "fused backend requires softmax_lse to use dtype "
+            f"{EXPECTED_LSE_DTYPE}."
+        )
+    return None
+
+
+def support_error(*args, **kwargs) -> Optional[str]:
+    """Backward-compatible alias for the fused forward support contract."""
+    return forward_support_error(*args, **kwargs)
+
+
+def supports_attention_call(*args, **kwargs) -> bool:
+    return forward_support_error(*args, **kwargs) is None
+
+
+def supports_backward_call(*args, **kwargs) -> bool:
+    return backward_support_error(*args, **kwargs) is None
+
+
+@dataclass(frozen=True)
+class FusedAttentionAPI:
+    """Public API bundle for the Triton fused backend.
+
+    Keeping the contract behind a single exported object lets callers depend on
+    one stable surface instead of probing individual functions and constants.
+    """
+
+    supported_dtypes: frozenset = SUPPORTED_DTYPES
+    supported_head_dims: frozenset = SUPPORTED_HEAD_DIMS
+    required_sequence_multiple: int = REQUIRED_SEQUENCE_MULTIPLE
+    expected_lse_dtype: torch.dtype = EXPECTED_LSE_DTYPE
+    active_triton_backend: str = ACTIVE_TRITON_BACKEND
+    active_torch_device_type: str = ACTIVE_TORCH_DEVICE_TYPE
+
+    def forward_support_error(self, *args, **kwargs) -> Optional[str]:
+        return forward_support_error(*args, **kwargs)
+
+    def backward_support_error(self, *args, **kwargs) -> Optional[str]:
+        return backward_support_error(*args, **kwargs)
+
+    def supports_attention_call(self, *args, **kwargs) -> bool:
+        return supports_attention_call(*args, **kwargs)
+
+    def supports_backward_call(self, *args, **kwargs) -> bool:
+        return supports_backward_call(*args, **kwargs)
+
+    def forward(self, *args, **kwargs):
+        return attention(*args, **kwargs)
+
+    def backward(self, *args, **kwargs):
+        return attention_backward(*args, **kwargs)
+
+
+FUSED_BACKEND_API = FusedAttentionAPI()
+
+
+def get_backend_api() -> FusedAttentionAPI:
+    return FUSED_BACKEND_API
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +385,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 
 
 @triton.autotune(configs=list(filter(keep, configs)),
-                 key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+                 key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,
@@ -203,11 +394,12 @@ def _attn_fwd(sm_scale, M,
               BLOCK_M: tl.constexpr,
               BLOCK_N: tl.constexpr,
               FP8_OUTPUT: tl.constexpr,
+              USE_BF16: tl.constexpr,
               STAGE: tl.constexpr,
               warp_specialize: tl.constexpr,
               IS_HOPPER: tl.constexpr,
               ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
+    dtype = tl.float8e5 if FP8_OUTPUT else (tl.bfloat16 if USE_BF16 else tl.float16)
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -287,6 +479,7 @@ def _attn_bwd_dkdv(dk, dv,
                    H, N_CTX, BLOCK_M1: tl.constexpr,
                    BLOCK_N1: tl.constexpr,
                    HEAD_DIM: tl.constexpr,
+                   MATMUL_BF16: tl.constexpr,
                    start_n, start_m, num_steps,
                    MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
@@ -295,6 +488,7 @@ def _attn_bwd_dkdv(dk, dv,
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
+    matmul_dtype = tl.bfloat16 if MATMUL_BF16 else tl.float16
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
@@ -308,12 +502,12 @@ def _attn_bwd_dkdv(dk, dv,
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs)
         ppT = pT
-        ppT = ppT.to(tl.float16)
+        ppT = ppT.to(matmul_dtype)
         dv += tl.dot(ppT, do)
         Di = tl.load(D + offs_m)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
+        dsT = dsT.to(matmul_dtype)
         dk += tl.dot(dsT, tl.trans(qT))
         curr_m += step_m
         qT_ptrs += step_m * stride_tok
@@ -329,6 +523,7 @@ def _attn_bwd_dq(dq, q, K, V,
                  BLOCK_M2: tl.constexpr,
                  BLOCK_N2: tl.constexpr,
                  HEAD_DIM: tl.constexpr,
+                 MATMUL_BF16: tl.constexpr,
                  start_m, start_n, num_steps,
                  MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
@@ -338,6 +533,7 @@ def _attn_bwd_dq(dq, q, K, V,
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     Di = tl.load(D + offs_m)
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
+    matmul_dtype = tl.bfloat16 if MATMUL_BF16 else tl.float16
     curr_n = start_n
     step_n = BLOCK_N2
     for blk_idx in range(num_steps):
@@ -351,7 +547,7 @@ def _attn_bwd_dq(dq, q, K, V,
             p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
+        ds = ds.to(matmul_dtype)
         dq += tl.dot(ds, tl.trans(kT))
         curr_n += step_n
         kT_ptrs += step_n * stride_tok
@@ -372,6 +568,7 @@ def _attn_bwd(Q, K, V, sm_scale,
               BLOCK_N2: tl.constexpr,
               BLK_SLICE_FACTOR: tl.constexpr,
               HEAD_DIM: tl.constexpr,
+              MATMUL_BF16: tl.constexpr,
               CAUSAL: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645996
 
@@ -413,6 +610,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                                  stride_tok, stride_d,
                                  H, N_CTX,
                                  MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,
+                                 MATMUL_BF16,
                                  start_n, start_m, num_steps,
                                  MASK=True)
         start_m += num_steps * MASK_BLOCK_M1
@@ -425,6 +623,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                              stride_tok, stride_d,
                              H, N_CTX,
                              BLOCK_M1, BLOCK_N1, HEAD_DIM,
+                             MATMUL_BF16,
                              start_n, start_m, num_steps,
                              MASK=False)
 
@@ -457,6 +656,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                           stride_tok, stride_d,
                           H, N_CTX,
                           BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,
+                          MATMUL_BF16,
                           start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,
                           MASK=True)
         end_n -= num_steps * MASK_BLOCK_N2
@@ -468,6 +668,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                       stride_tok, stride_d,
                       H, N_CTX,
                       BLOCK_M2, BLOCK_N2, HEAD_DIM,
+                      MATMUL_BF16,
                       start_m, start_n, num_steps,
                       MASK=False)
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -488,7 +689,7 @@ class _attention(torch.autograd.Function):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        assert HEAD_DIM_K in SUPPORTED_HEAD_DIMS
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
@@ -518,7 +719,7 @@ class _attention(torch.autograd.Function):
             desc_o = o
 
         def alloc_fn(size: int, align: int, _):
-            return torch.empty(size, dtype=torch.int8, device="cuda")
+            return torch.empty(size, dtype=torch.int8, device=q.device)
 
         triton.set_allocator(alloc_fn)
 
@@ -538,6 +739,7 @@ class _attention(torch.autograd.Function):
             N_CTX=q.shape[2],
             HEAD_DIM=HEAD_DIM_K,
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+            USE_BF16=q.dtype == torch.bfloat16,
             STAGE=stage,
             warp_specialize=warp_specialize,
             IS_HOPPER=is_hopper(),
@@ -591,14 +793,54 @@ class _attention(torch.autograd.Function):
             BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=ctx.HEAD_DIM,
+            MATMUL_BF16=q.dtype == torch.bfloat16,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             CAUSAL=ctx.causal,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None
+
+
+def attention_backward(q, k, v, o, M, do, causal, sm_scale):
+    """Run the fused attention backward kernel using explicit saved tensors.
+
+    This keeps callers from depending on the private ``_attention`` autograd
+    context layout directly.
+    """
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.saved_tensors = (q, k, v, o, M)
+    ctx.sm_scale = sm_scale
+    ctx.HEAD_DIM = q.shape[-1]
+    ctx.causal = causal
+    grads = _attention.backward(ctx, do, None)
+    dq, dk, dv = grads[:3]
+    return dq, dk, dv
 
 
 attention = _attention.apply
+
+__all__ = [
+    "ACTIVE_TORCH_DEVICE_TYPE",
+    "ACTIVE_TRITON_BACKEND",
+    "EXPECTED_LSE_DTYPE",
+    "FUSED_BACKEND_API",
+    "FusedAttentionAPI",
+    "HAS_FLASH",
+    "REQUIRED_SEQUENCE_MULTIPLE",
+    "SUPPORTED_DTYPES",
+    "SUPPORTED_HEAD_DIMS",
+    "attention",
+    "attention_backward",
+    "backward_support_error",
+    "forward_support_error",
+    "get_backend_api",
+    "support_error",
+    "supports_attention_call",
+    "supports_backward_call",
+]
 
 
 # ---------------------------------------------------------------------------

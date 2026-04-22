@@ -9,35 +9,104 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
 NUM_ITER="${NUM_ITER:-10}"
 NUM_HEADS="${NUM_HEADS:-32}"
 HEAD_DIM="${HEAD_DIM:-128}"
-FORWARD_ONLY="${FORWARD_ONLY:-1}"
 SEQ_LENGTHS_STR="${SEQ_LENGTHS:-4096 8192}"
 ALGOS_STR="${ALGOS:-ringX_attn.ringX1_attn ringX_attn.ringX2_attn ringX_attn.ringX3_attn ringX_attn.ringX4_attn}"
+DTYPE="${DTYPE:-${BENCHMARK_DTYPE:-bfloat16}}"
+BACKEND="${BACKEND:-${RINGX_ATTN_BACKEND:-}}"
+STOP_ON_ERROR="${STOP_ON_ERROR:-0}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/benchmark_results/$(date +%Y%m%d_%H%M%S)}"
+
+if [[ -n "${BENCHMARK_MODES:-}" ]]; then
+  BENCHMARK_MODES_STR="$BENCHMARK_MODES"
+elif [[ -n "${FORWARD_ONLY:-}" ]]; then
+  if [[ "$FORWARD_ONLY" == "1" ]]; then
+    BENCHMARK_MODES_STR="forward"
+  else
+    BENCHMARK_MODES_STR="fwd_bwd backward"
+  fi
+else
+  BENCHMARK_MODES_STR="forward fwd_bwd backward"
+fi
 
 mkdir -p "$OUT_DIR/raw"
 
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$REPO_ROOT/ringX_attn:$REPO_ROOT/benchmark${RING_FLASH_ATTN_ROOT:+:$RING_FLASH_ATTN_ROOT}:${PYTHONPATH:-}"
+if [[ -n "$BACKEND" ]]; then
+  export RINGX_ATTN_BACKEND="$BACKEND"
+fi
+export BENCHMARK_DTYPE="$DTYPE"
 
 if ! python - <<'PY' >/dev/null 2>&1
-import flash_attn
+import ringX_attn.backend
 PY
 then
-  echo "Missing Python deps. Make sure flash_attn is importable." >&2
+  echo "Missing Python deps. Make sure ringX_attn is importable." >&2
   exit 1
 fi
 
 read -r -a SEQ_LENGTHS <<< "$SEQ_LENGTHS_STR"
 read -r -a ALGOS <<< "$ALGOS_STR"
+read -r -a BENCHMARK_MODES <<< "$BENCHMARK_MODES_STR"
+
+HAS_RING_FLASH_ATTN=0
+if python - <<'PY' >/dev/null 2>&1
+import importlib.util
+raise SystemExit(0 if importlib.util.find_spec("ring_flash_attn") is not None else 1)
+PY
+then
+  HAS_RING_FLASH_ATTN=1
+fi
 
 {
-  echo "algo,impl,causal,batch,seqlen,num_heads,head_dim,mode,ngpus,iter_per_s,total_sec,log_file"
+  echo "algo,impl,mode,status,requested_backend,forward_backend,backward_backend,causal,batch,seqlen,num_heads,head_dim,dtype,ngpus,iter_per_s,total_sec,reason,log_file"
 } > "$OUT_DIR/summary.csv"
+
+append_results_from_log() {
+  local log_file="$1"
+  python - "$log_file" "$OUT_DIR/summary.csv" <<'PY'
+import csv
+import json
+import sys
+
+log_file, summary_file = sys.argv[1], sys.argv[2]
+rows = []
+with open(log_file, "r", encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        if not line.startswith("BENCHMARK_RESULT "):
+            continue
+        payload = json.loads(line[len("BENCHMARK_RESULT "):])
+        rows.append([
+            payload.get("algo", ""),
+            payload.get("impl", ""),
+            payload.get("mode", ""),
+            payload.get("status", ""),
+            payload.get("requested_backend", ""),
+            payload.get("forward_backend", ""),
+            payload.get("backward_backend", ""),
+            payload.get("causal", ""),
+            payload.get("batch", ""),
+            payload.get("seqlen", ""),
+            payload.get("num_heads", ""),
+            payload.get("head_dim", ""),
+            payload.get("dtype", ""),
+            payload.get("ngpus", ""),
+            payload.get("iter_per_s", ""),
+            payload.get("total_sec", ""),
+            (payload.get("reason", "") or "").replace("\n", " ").replace("\r", " "),
+            log_file,
+        ])
+
+if rows:
+    with open(summary_file, "a", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerows(rows)
+PY
+}
 
 for algo in "${ALGOS[@]}"; do
   causal_flag=()
   algo_short="${algo##*.}"
-  
+
   case "$algo_short" in
     ringX1_attn|ringX1o_attn)
       causal_flag=()
@@ -52,51 +121,76 @@ for algo in "${ALGOS[@]}"; do
   esac
 
   for seqlen in "${SEQ_LENGTHS[@]}"; do
-    log_file="$OUT_DIR/raw/${algo}.b${BATCH_SIZE}.s${seqlen}.h${NUM_HEADS}.d${HEAD_DIM}.log"
-
-    cmd=(
-      torchrun
-      --standalone
-      --nproc_per_node="$NPROC"
-      benchmark/benchmark_ringX_func.py
-      --module "$algo"
-      --batch_size "$BATCH_SIZE"
-      --num_iter "$NUM_ITER"
-      --seq_length "$seqlen"
-      --num_heads "$NUM_HEADS"
-      --head_dim "$HEAD_DIM"
-    )
-
-    if [[ ${#causal_flag[@]} -gt 0 ]]; then
-      cmd+=("${causal_flag[@]}")
-    fi
-    if [[ "$FORWARD_ONLY" == "1" ]]; then
-      cmd+=(--forward_only)
+    impls=("${algo_short}_func")
+    if [[ "$HAS_RING_FLASH_ATTN" == "1" ]]; then
+      impls+=(zigzag_ring_flash_attn_func stripe_flash_attn_func ring_flash_attn_func)
     fi
 
-    echo ">>> Running: ${cmd[*]}"
-    "${cmd[@]}" 2>&1 | tee "$log_file"
+    for mode in "${BENCHMARK_MODES[@]}"; do
+      for impl in "${impls[@]}"; do
+        log_file="$OUT_DIR/raw/${algo}.impl${impl}.mode${mode}.b${BATCH_SIZE}.s${seqlen}.h${NUM_HEADS}.d${HEAD_DIM}.dtype${DTYPE}.log"
 
-    awk -v algo="$algo" \
-        -v mode="$([[ "$FORWARD_ONLY" == "1" ]] && echo forward || echo fwd_bwd)" \
-        -v logfile="$log_file" '
-      /^# / { impl=$2 }
-      /ngpus:/ {
-        if (match($0, /ngpus: ([0-9]+), causal: (True|False), batch: ([0-9]+), seqlen: ([0-9]+), num_heads: ([0-9]+), head_dim: ([0-9]+)/, m)) {
-          ngpus=m[1]
-          causal=m[2]
-          batch=m[3]
-          seqlen=m[4]
-          num_heads=m[5]
-          head_dim=m[6]
-        }
-      }
-      /iter\/s, .* sec/ {
-        if (match($0, /([0-9.]+) iter\/s, ([0-9.]+) sec/, m)) {
-          print algo "," impl "," causal "," batch "," seqlen "," num_heads "," head_dim "," mode "," ngpus "," m[1] "," m[2] "," logfile
-        }
-      }
-    ' "$log_file" >> "$OUT_DIR/summary.csv"
+        cmd=(
+          torchrun
+          --standalone
+          --nproc_per_node="$NPROC"
+          benchmark/benchmark_ringX_func.py
+          --module "$algo"
+          --impl "$impl"
+          --batch_size "$BATCH_SIZE"
+          --num_iter "$NUM_ITER"
+          --seq_length "$seqlen"
+          --num_heads "$NUM_HEADS"
+          --head_dim "$HEAD_DIM"
+          --dtype "$DTYPE"
+          --modes "$mode"
+        )
+
+        if [[ ${#causal_flag[@]} -gt 0 ]]; then
+          cmd+=("${causal_flag[@]}")
+        fi
+
+        echo ">>> Running: ${cmd[*]}"
+        set +e
+        "${cmd[@]}" 2>&1 | tee "$log_file"
+        cmd_status=${PIPESTATUS[0]}
+        set -e
+
+        append_results_from_log "$log_file"
+
+        if [[ $cmd_status -ne 0 ]] && ! grep -q '^BENCHMARK_RESULT ' "$log_file"; then
+          python - "$OUT_DIR/summary.csv" "$algo" "$impl" "$mode" "$BATCH_SIZE" "$seqlen" "$NUM_HEADS" "$HEAD_DIM" "$DTYPE" "$NPROC" "$log_file" "$cmd_status" "$BACKEND" <<'PY'
+import csv
+import sys
+summary_file, algo, impl, mode, batch, seqlen, num_heads, head_dim, dtype, ngpus, log_file, status, backend = sys.argv[1:]
+with open(summary_file, "a", newline="", encoding="utf-8") as handle:
+    csv.writer(handle).writerow([
+        algo,
+        impl,
+        mode,
+        "failed",
+        backend or "auto",
+        "",
+        "",
+        "",
+        batch,
+        seqlen,
+        num_heads,
+        head_dim,
+        dtype,
+        ngpus,
+        "",
+        "",
+        f"torchrun exited with status {status}",
+        log_file,
+    ])
+PY
+          if [[ "$STOP_ON_ERROR" == "1" ]]; then
+            exit "$cmd_status"
+          fi
+        fi
+      done
+    done
   done
 done
 

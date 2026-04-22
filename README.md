@@ -27,14 +27,15 @@ pip install -e .
 
 
 ### Backend selection
-The package supports two local attention backends:
+The package supports three local attention backends:
 
 - `flash_attn`: uses the FlashAttention kernels when the `flash_attn` package is installed
+- `fused`: uses the Triton-based fused attention path in `ringX_attn.fused_attention`
 - `portable`: pure PyTorch fallback
 
 Selection rules:
 
-- default is `auto`, which prefers `flash_attn` when available and otherwise uses `portable`
+- default is `auto`, which prefers `flash_attn`, then `fused`, and otherwise uses `portable`
 - set `RINGX_ATTN_BACKEND=portable` to force the fallback backend
 - or switch programmatically:
 
@@ -44,12 +45,13 @@ from ringX_attn import set_backend
 set_backend("portable")
 ```
 
-Each `ringX*_attn_func(...)` call also accepts `backend=None | "flash_attn" | "portable"` for per-call overrides.
+Each `ringX*_attn_func(...)` call also accepts `backend=None | "flash_attn" | "fused" | "portable"` for per-call overrides.
 
-Current fallback limitations:
+Current backend limitations:
 
-- `dropout_p` must be `0`
-- `alibi_slopes` is not supported
+- `portable`: `dropout_p` must be `0`, and `alibi_slopes` is not supported
+- `fused`: requires Triton, Q/K/V on the same active Triton device type and dtype, `dropout_p=0`, `window_size=(-1, -1)`, equal Q/K/V sequence lengths, a sequence length divisible by `128`, and `head_dim` in `{16, 32, 64, 128, 256}`; backward additionally requires `dout` and `out` to match `q`, and `softmax_lse` to have shape `(batch, heads, seqlen)` with dtype `float32`
+- when `backend="auto"`, unsupported fused calls fall back to `portable` automatically
 
 Portable backend tuning:
 
@@ -149,4 +151,3 @@ If you find this work helpful in your research or applications, please consider 
       year={2026},
 }
 ``` 
-
